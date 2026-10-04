@@ -7,7 +7,7 @@ All agents use this instead of calling ollama directly.
 Features:
 - JSON-only output
 - Retries on failure
-- Timeouts
+- Timeouts (per-attempt and total)
 - Logging
 - Output validation
 """
@@ -18,6 +18,7 @@ import logging
 from typing import Dict, Any, Optional, Type
 from pydantic import BaseModel
 import ollama
+from ollama import Client as OllamaClient
 
 
 # Setup logging
@@ -31,7 +32,8 @@ class LLMConfig(BaseModel):
     top_p: float = 0.9
     num_predict: int = 2000
     num_ctx: int = 8192
-    total_timeout_seconds: int = 60  # Total time limit for all attempts
+    total_timeout_seconds: int = 120  # Total time limit for all attempts (~2 minutes)
+    per_attempt_timeout_seconds: int = 60  # Per-attempt timeout (default 60s for analyzer)
     max_retries: int = 1  # Maximum 1 retry (2 total attempts)
 
 
@@ -66,6 +68,17 @@ class LLMWrapper:
         """
         self.config = config or LLMConfig()
         self.call_count = 0
+        
+        # Create Ollama client with timeout
+        try:
+            self.client = OllamaClient(
+                host='http://localhost:11434',
+                timeout=self.config.per_attempt_timeout_seconds
+            )
+            logger.info(f"LLMWrapper initialized with model: {self.config.model_name}, timeout: {self.config.per_attempt_timeout_seconds}s")
+        except Exception as e:
+            logger.warning(f"Failed to create Ollama client with timeout: {e}, using default")
+            self.client = None
         
         logger.info(f"LLMWrapper initialized with model: {self.config.model_name}")
     
@@ -109,6 +122,19 @@ class LLMWrapper:
                 logger.error(error_msg)
                 raise TimeoutError(error_msg)
             
+            # Calculate remaining time for this attempt
+            remaining_total = self.config.total_timeout_seconds - elapsed
+            attempt_timeout = min(self.config.per_attempt_timeout_seconds, remaining_total)
+            
+            if attempt_timeout <= 0:
+                duration = time.time() - overall_start_time
+                error_msg = (
+                    f"LLM call exceeded total timeout of {self.config.total_timeout_seconds}s "
+                    f"before attempt {attempt + 1}. Total time: {duration:.2f}s"
+                )
+                logger.error(error_msg)
+                raise TimeoutError(error_msg)
+            
             attempt_start = time.time()
             
             try:
@@ -132,17 +158,40 @@ class LLMWrapper:
                 logger.debug(f"Attempt {attempt + 1}/{self.config.max_retries + 1}")
                 
                 try:
-                    response = ollama.chat(
-                        model=self.config.model_name,
-                        messages=messages,
-                        format='json' if force_json else None,
-                        options={
-                            'temperature': self.config.temperature,
-                            'top_p': self.config.top_p,
-                            'num_predict': self.config.num_predict,
-                            'num_ctx': self.config.num_ctx
-                        }
-                    )
+                    # Use client with timeout if available, otherwise fall back
+                    call_start = time.time()
+                    
+                    if self.client:
+                        response = self.client.chat(
+                            model=self.config.model_name,
+                            messages=messages,
+                            format='json' if force_json else None,
+                            options={
+                                'temperature': self.config.temperature,
+                                'top_p': self.config.top_p,
+                                'num_predict': self.config.num_predict,
+                                'num_ctx': self.config.num_ctx
+                            }
+                        )
+                    else:
+                        response = ollama.chat(
+                            model=self.config.model_name,
+                            messages=messages,
+                            format='json' if force_json else None,
+                            options={
+                                'temperature': self.config.temperature,
+                                'top_p': self.config.top_p,
+                                'num_predict': self.config.num_predict,
+                                'num_ctx': self.config.num_ctx
+                            }
+                        )
+                    
+                    call_duration = time.time() - call_start
+                    
+                    # Check if this single call exceeded the per-attempt timeout
+                    if call_duration > attempt_timeout:
+                        logger.warning(f"Call took {call_duration:.2f}s, exceeded attempt timeout of {attempt_timeout:.2f}s")
+                        
                 except ConnectionError as e:
                     # Connection error - fail immediately
                     duration = time.time() - overall_start_time
@@ -198,6 +247,7 @@ class LLMWrapper:
                 
                 # Success!
                 duration = time.time() - overall_start_time
+                print(f"⏱️  LLM call took {duration:.2f}s")
                 logger.info(f"✅ LLM call succeeded in {duration:.2f}s (attempt {attempt + 1})")
                 
                 return LLMResponse(

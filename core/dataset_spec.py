@@ -32,6 +32,7 @@ class PipelineStatus(str, Enum):
     SUCCESS = "success"
     PARTIAL_SUCCESS = "partial_success"
     FAILED = "failed"
+    PAUSED = "paused"
 
 
 class AgentStatus(str, Enum):
@@ -61,7 +62,9 @@ class RequirementSpec(BaseModel):
     data_modality: Optional[DataModality] = Field(None, description="Type of data")
     
     # Expected characteristics
-    expected_features: List[str] = Field(default_factory=list, description="Expected columns/features")
+    expected_features: List[str] = Field(default_factory=list, description="Expected input features/measurements")
+    target_variable: Optional[str] = Field(None, description="Target variable for prediction problems")
+    target_requires_derivation: bool = Field(False, description="True if target variable must be derived from real events or thresholds")
     expected_size: Optional[str] = Field(None, description="Expected dataset size")
     
     # Temporal requirements
@@ -93,8 +96,11 @@ class RequirementSpec(BaseModel):
     explicitly_stated: List[str] = Field(default_factory=list, description="What user explicitly said")
     inferred_by_model: List[str] = Field(default_factory=list, description="What model inferred")
     
-    # Confidence
-    confidence: float = Field(0.0, ge=0.0, le=1.0, description="Overall requirement confidence")
+    # Completeness (how much detail the user provided)
+    completeness: float = Field(0.0, ge=0.0, le=1.0, description="Request completeness (0-1, based on detail provided)")
+    
+    # Clarification tracking
+    clarification_round: int = Field(0, description="Number of clarification rounds completed (0 or 1)")
 
 
 # ============================================================================

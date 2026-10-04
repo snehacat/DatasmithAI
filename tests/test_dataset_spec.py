@@ -37,13 +37,13 @@ def test_requirement_spec_validation():
         description="Flood prediction data",
         domain="environmental",
         data_modality=DataModality.TABULAR,
-        confidence=0.85
+        completeness=0.85
     )
     
     assert req.dataset_name == "Flood Dataset"
     assert req.domain == "environmental"
     assert req.data_modality == DataModality.TABULAR
-    assert 0.0 <= req.confidence <= 1.0
+    assert 0.0 <= req.completeness <= 1.0
 
 
 def test_requirement_spec_new_fields():
@@ -110,29 +110,29 @@ def test_requirement_spec_invalid_output_format():
         )
 
 
-def test_confidence_validation():
-    """Test confidence scores are in valid range."""
-    # Valid confidence
+def test_completeness_validation():
+    """Test completeness scores are in valid range."""
+    # Valid completeness
     req = RequirementSpec(
         dataset_name="Test",
         description="Test",
-        confidence=0.5
+        completeness=0.5
     )
-    assert req.confidence == 0.5
+    assert req.completeness == 0.5
     
-    # Invalid confidence should fail
+    # Invalid completeness should fail
     with pytest.raises(ValueError):
         RequirementSpec(
             dataset_name="Test",
             description="Test",
-            confidence=1.5  # > 1.0
+            completeness=1.5  # > 1.0
         )
     
     with pytest.raises(ValueError):
         RequirementSpec(
             dataset_name="Test",
             description="Test",
-            confidence=-0.1  # < 0.0
+            completeness=-0.1  # < 0.0
         )
 
 
@@ -170,7 +170,7 @@ def test_provenance_requirement():
         source_id="SRC_001",
         raw_data={"temperature": 25.5},
         extracted_at=datetime.now().isoformat(),
-        confidence=0.9,
+        completeness=0.9,
         extraction_method="csv_parser",
         source_url="https://noaa.gov/data/temp.csv",
         source_type="meteorological_data_provider"
@@ -203,12 +203,12 @@ def test_warnings_and_errors():
     """Test adding warnings and errors."""
     spec = create_initial_spec("Test", "Test")
     
-    spec.add_warning("Low confidence in domain detection")
+    spec.add_warning("Low completeness in domain detection")
     spec.add_error("Failed to connect to data source")
     
     assert len(spec.warnings) == 1
     assert len(spec.errors) == 1
-    assert "Low confidence" in spec.warnings[0]
+    assert "Low completeness" in spec.warnings[0]
     assert "Failed to connect" in spec.errors[0]
 
 

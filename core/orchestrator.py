@@ -18,6 +18,7 @@ from .dataset_spec import (
     PipelineStatus,
     validate_spec
 )
+from .run_manager import get_run_manager
 
 
 # Setup logging
@@ -71,7 +72,7 @@ class Orchestrator:
     
     def __init__(
         self,
-        save_dir: str = "./runs",
+        save_dir: str = "./runs",  # Deprecated, use run_manager instead
         auto_save: bool = True,
         validate_after_each: bool = True
     ):
@@ -79,12 +80,13 @@ class Orchestrator:
         Initialize orchestrator.
         
         Args:
-            save_dir: Directory to save specs (for resume)
+            save_dir: Deprecated - use run_manager
             auto_save: Save after each agent completes
             validate_after_each: Validate spec after each agent
         """
-        self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.run_manager = get_run_manager()
+        # Auto-prune old runs on startup
+        self.run_manager.auto_prune()
         
         self.auto_save = auto_save
         self.validate_after_each = validate_after_each
@@ -92,7 +94,7 @@ class Orchestrator:
         self.agents: List[AgentDefinition] = []
         self.current_spec: Optional[DatasetSpec] = None
         
-        logger.info(f"Orchestrator initialized (save_dir={save_dir})")
+        logger.info(f"Orchestrator initialized with RunManager")
     
     def register_agent(self, agent: AgentDefinition):
         """Register an agent to the pipeline."""
@@ -123,7 +125,7 @@ class Orchestrator:
         # Create or load spec
         if resume_from:
             logger.info(f"Resuming from spec: {resume_from}")
-            spec = self.load_spec(resume_from)
+            spec = self.run_manager.load_spec(resume_from)
             if spec is None:
                 raise ValueError(f"Could not load spec: {resume_from}")
         else:
@@ -136,18 +138,33 @@ class Orchestrator:
         
         # Save initial state
         if self.auto_save and not resume_from:
-            self.save_spec(spec)
+            self.run_manager.save_spec(spec)
         
         # Run each agent
         for agent_def in self.agents:
             try:
                 spec = self._run_agent(spec, agent_def)
+                
+                # PAUSE LOGIC: After RequirementAnalyzer, check if we need user clarification
+                if agent_def.name == "RequirementAnalyzer" and spec.requirement:
+                    if self._should_pause_for_clarification(spec.requirement):
+                        logger.warning("Pipeline paused: Requirement needs clarification")
+                        spec.pipeline_status = PipelineStatus.PAUSED
+                        spec.add_warning(
+                            "Pipeline paused for user clarification. "
+                            f"Completeness: {spec.requirement.completeness:.2f}, "
+                            f"Questions: {len(spec.requirement.clarifying_questions)}"
+                        )
+                        if self.auto_save:
+                            self.run_manager.save_spec(spec)
+                        break  # Stop pipeline, return spec with questions
+                
             except Exception as e:
                 logger.error(f"Fatal error in agent {agent_def.name}: {e}")
                 spec.pipeline_status = PipelineStatus.FAILED
                 spec.add_error(f"Fatal error in {agent_def.name}: {e}")
                 if self.auto_save:
-                    self.save_spec(spec)
+                    self.run_manager.save_spec(spec)
                 raise
         
         # Final status
@@ -156,13 +173,43 @@ class Orchestrator:
         
         # Final save
         if self.auto_save:
-            self.save_spec(spec)
+            self.run_manager.save_spec(spec)
         
         logger.info("="*70)
         logger.info(f"PIPELINE EXECUTION COMPLETE: {spec.pipeline_status.value}")
         logger.info("="*70)
         
         return spec
+    
+    def _should_pause_for_clarification(self, requirement: 'RequirementSpec') -> bool:
+        """
+        Check if pipeline should pause for user clarification.
+        
+        Pause ONLY when something essential is missing:
+        - No identifiable domain/topic (completeness extremely low < 0.15)
+        - Request cannot be understood at all
+        
+        For missing geography, size, freshness or features:
+        - Continue with defaults (already in RequirementSpec)
+        - Questions are kept in spec for user to see
+        
+        Args:
+            requirement: RequirementSpec to check
+            
+        Returns:
+            True if should pause for essential clarification
+        """
+        # Don't pause for unsupported requests - they're clear rejections
+        if not requirement.is_supported:
+            return False
+        
+        # Pause ONLY if no domain can be identified (request is unintelligible)
+        if not requirement.domain:
+            logger.info("Pausing: Request unintelligible (no domain identified)")
+            return True
+        
+        # Otherwise continue - defaults will be used for missing optional info
+        return False
     
     def _run_agent(self, spec: DatasetSpec, agent_def: AgentDefinition) -> DatasetSpec:
         """Run a single agent."""
@@ -248,7 +295,7 @@ class Orchestrator:
             
             # Save if enabled
             if self.auto_save:
-                self.save_spec(updated_spec)
+                self.run_manager.save_spec(updated_spec)
             
             return updated_spec
             
@@ -270,14 +317,14 @@ class Orchestrator:
             
             # Save failure state
             if self.auto_save:
-                self.save_spec(spec)
+                self.run_manager.save_spec(spec)
             
             # Re-raise to stop pipeline
             raise
     
     def save_spec(self, spec: DatasetSpec) -> Path:
         """
-        Save spec to disk.
+        Save spec using run manager.
         
         Args:
             spec: Spec to save
@@ -285,24 +332,11 @@ class Orchestrator:
         Returns:
             Path where saved
         """
-        spec.mark_updated()
-        
-        # Filename: spec_id.json
-        filepath = self.save_dir / f"{spec.spec_id}.json"
-        
-        # Convert to JSON
-        spec_dict = spec.model_dump(mode='json')
-        
-        # Write
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(spec_dict, f, indent=2)
-        
-        logger.debug(f"Saved spec to: {filepath}")
-        return filepath
+        return self.run_manager.save_spec(spec)
     
     def load_spec(self, spec_id: str) -> Optional[DatasetSpec]:
         """
-        Load spec from disk.
+        Load spec using run manager.
         
         Args:
             spec_id: ID of spec to load
@@ -310,29 +344,12 @@ class Orchestrator:
         Returns:
             Loaded spec or None if not found
         """
-        filepath = self.save_dir / f"{spec_id}.json"
-        
-        if not filepath.exists():
-            logger.error(f"Spec not found: {filepath}")
-            return None
-        
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                spec_dict = json.load(f)
-            
-            spec = DatasetSpec(**spec_dict)
-            logger.info(f"Loaded spec from: {filepath}")
-            return spec
-            
-        except Exception as e:
-            logger.error(f"Failed to load spec: {e}")
-            return None
+        return self.run_manager.load_spec(spec_id)
     
     def list_specs(self) -> List[str]:
         """List all saved spec IDs."""
-        spec_files = list(self.save_dir.glob("*.json"))
-        spec_ids = [f.stem for f in spec_files]
-        return sorted(spec_ids)
+        runs = self.run_manager.list_runs()
+        return [spec_id for spec_id, _, _, _ in runs]
     
     def get_current_spec(self) -> Optional[DatasetSpec]:
         """Get current spec being processed."""
@@ -342,4 +359,4 @@ class Orchestrator:
 # Convenience function
 def create_orchestrator(save_dir: str = "./runs") -> Orchestrator:
     """Create a new orchestrator instance."""
-    return Orchestrator(save_dir=save_dir)
+    return Orchestrator()

@@ -25,12 +25,12 @@ logs/
 
 # Saved states and specs
 runs/
+test_runs/
 *.json
 !requirements.json
 
 # Test outputs
 .pytest_cache/
-test_runs/
 htmlcov/
 .coverage
 
@@ -39,7 +39,6 @@ data/
 datasets/
 *.csv
 *.xlsx
-*.json
 
 # Model files
 models/

@@ -33,7 +33,7 @@ def test_global_llm_singleton():
     assert llm1 is llm2  # Same instance
 
 
-@pytest.mark.skipif(True, reason="Requires Ollama running - manual test only")
+@pytest.mark.skip(reason="Requires Ollama running with qwen2.5:3b")
 def test_successful_llm_call():
     """Test successful LLM call with JSON output."""
     llm = LLMWrapper()
@@ -51,7 +51,7 @@ def test_successful_llm_call():
     assert llm.call_count == 1
 
 
-@pytest.mark.skipif(True, reason="Requires Ollama running - manual test only")
+@pytest.mark.skip(reason="Requires Ollama running with qwen2.5:3b")
 def test_schema_validation():
     """Test schema validation catches invalid responses."""
     llm = LLMWrapper()
@@ -95,7 +95,7 @@ def test_retry_configuration():
     assert llm.config.total_timeout_seconds == 30
 
 
-@pytest.mark.skipif(True, reason="Requires Ollama running - manual test only")
+@pytest.mark.skip(reason="Requires Ollama running with qwen2.5:3b")
 def test_invalid_json_handling():
     """Test handling of invalid JSON responses."""
     llm = LLMWrapper()
@@ -110,7 +110,7 @@ def test_invalid_json_handling():
     assert not response.success or response.content is None
 
 
-@pytest.mark.skipif(True, reason="Requires Ollama running - manual test only")
+@pytest.mark.skip(reason="Requires Ollama running with qwen2.5:3b")
 def test_llm_with_system_prompt():
     """Test LLM call with system prompt."""
     llm = LLMWrapper()
