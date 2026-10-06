@@ -1,9 +1,13 @@
 """
 Requirement Analyzer Agent
 
-Turns user's free-text request into structured requirement.
-Focus: Real, current data about nature and environment (weather, air quality, 
-fire, earthquakes, ocean, satellite-derived tabular data).
+Turns the user's free-text request into a structured requirement.
+
+PILOT DOMAIN: real, current data about nature and environment (weather, air
+quality, fire, earthquakes, ocean, satellite-derived tabular data).
+The pilot domain is controlled by the config constants right below the imports
+(PILOT_DOMAIN_LABEL, PILOT_DOMAIN_KEYWORDS, REJECTED_* lists). To widen the
+scope later, change those constants, nothing else.
 """
 
 import re
@@ -11,145 +15,297 @@ import logging
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from core.dataset_spec import DatasetSpec, RequirementSpec, DataModality
+from core.dataset_spec import DatasetSpec, RequirementSpec, DataModality, PipelineStatus
 from core.llm_wrapper import get_llm
 
 logger = logging.getLogger(__name__)
 
 
-# LLM output schema
+# ============================================================================
+# CONFIG: pilot domain ( what is in scope)
+# ============================================================================
+
+PILOT_DOMAIN_LABEL = "environmental and natural data"
+
+# A request is in scope if it contains at least one of these WHOLE words/phrases
+# (plural -s/-es is also accepted). Matching is whole-word, so 'ice' does not
+# match 'price' or 'police'.
+PILOT_DOMAIN_KEYWORDS = [
+    # weather / climate / atmosphere
+    'weather', 'climate', 'meteorological', 'meteorology', 'atmospheric', 'atmosphere',
+    'temperature', 'rain', 'rainfall', 'precipitation', 'monsoon', 'wind', 'humidity',
+    'atmospheric pressure', 'air pressure', 'barometric pressure',
+    'snow', 'snowfall', 'ice', 'heatwave', 'heat wave', 'cold wave', 'lightning',
+    'solar radiation', 'sunshine',
+    # air quality / pollution / gases
+    'air quality', 'pollution', 'pollutant', 'pm2.5', 'pm10', 'aqi', 'smog', 'dust',
+    'ozone', 'carbon dioxide', 'co2', 'methane', 'greenhouse gas', 'emissions',
+    # fire
+    'fire', 'wildfire', 'forest fire',
+    # earth / geology / hazards
+    'earthquake', 'seismic', 'tsunami', 'volcano', 'volcanic', 'landslide', 'avalanche',
+    'geological', 'geological hazards', 'erosion',
+    'flood', 'drought', 'storm', 'thunderstorm', 'cyclone', 'hurricane', 'typhoon', 'tornado',
+    # water / ocean
+    'ocean', 'marine', 'sea', 'sea level', 'sea surface', 'coral', 'river', 'lake',
+    'groundwater', 'water level', 'water quality', 'hydrological', 'hydrology', 'wetland',
+    'mangrove',
+    # land / vegetation / ecology
+    'forest', 'vegetation', 'ndvi', 'deforestation', 'land use', 'land cover', 'land surface',
+    'soil', 'soil moisture', 'glacier', 'glacial', 'permafrost',
+    'environment', 'environmental', 'ecological', 'ecosystem', 'biodiversity', 'wildlife',
+    'habitat', 'nature',
+    # remote sensing
+    'satellite', 'remote sensing', 'earth observation', 'modis', 'viirs', 'sentinel',
+    'landsat', 'era5',
+]
+
+# Clearly out-of-scope topics. Rejected immediately (no LLM call) even if an
+# environmental word is also present, e.g. "air pollution impact on stock market".
+# Kept short on purpose: anything with NO environmental keyword is rejected anyway.
+REJECTED_TOPIC_WORDS = [
+    'stock market', 'stock price', 'stock exchange', 'stocks', 'share price',
+    'finance', 'financial', 'trading', 'crypto', 'cryptocurrency',
+    'social media', 'twitter', 'facebook', 'instagram', 'tiktok',
+    'movie', 'film', 'shopping', 'ecommerce', 'e-commerce', 'retail',
+    'patient', 'hospital', 'blood pressure', 'medical record',
+]
+
+# Access restrictions we cannot work with. These are skipped when the user
+# NEGATES them ("no paid data", "without login required").
+REJECTED_ACCESS_WORDS = [
+    'private', 'paid', 'credential', 'confidential', 'paywall',
+    'login required', 'requires login', 'requiring login', 'password protected',
+]
+_NEGATORS = {'no', 'not', 'without', 'never', 'non', 'avoid', 'exclude', 'excluding'}
+
+# Locations the rule-based extractor knows (lowercase -> display name).
+# Unknown places are NOT guessed; the user is asked instead.
+LOCATIONS = {
+    # India: country, states, UTs
+    'india': 'India', 'andhra pradesh': 'Andhra Pradesh', 'arunachal pradesh': 'Arunachal Pradesh',
+    'assam': 'Assam', 'bihar': 'Bihar', 'chhattisgarh': 'Chhattisgarh', 'goa': 'Goa',
+    'gujarat': 'Gujarat', 'haryana': 'Haryana', 'himachal pradesh': 'Himachal Pradesh',
+    'jharkhand': 'Jharkhand', 'karnataka': 'Karnataka', 'kerala': 'Kerala',
+    'madhya pradesh': 'Madhya Pradesh', 'maharashtra': 'Maharashtra', 'manipur': 'Manipur',
+    'meghalaya': 'Meghalaya', 'mizoram': 'Mizoram', 'nagaland': 'Nagaland', 'odisha': 'Odisha',
+    'punjab': 'Punjab', 'rajasthan': 'Rajasthan', 'sikkim': 'Sikkim', 'tamil nadu': 'Tamil Nadu',
+    'telangana': 'Telangana', 'tripura': 'Tripura', 'uttar pradesh': 'Uttar Pradesh',
+    'uttarakhand': 'Uttarakhand', 'west bengal': 'West Bengal',
+    'jammu and kashmir': 'Jammu and Kashmir', 'ladakh': 'Ladakh',
+    # India: cities / places
+    'delhi': 'Delhi', 'new delhi': 'New Delhi', 'mumbai': 'Mumbai', 'bangalore': 'Bangalore',
+    'bengaluru': 'Bengaluru', 'chennai': 'Chennai', 'kolkata': 'Kolkata', 'hyderabad': 'Hyderabad',
+    'pune': 'Pune', 'ahmedabad': 'Ahmedabad', 'jaipur': 'Jaipur', 'lucknow': 'Lucknow',
+    'patna': 'Patna', 'bhopal': 'Bhopal', 'chandigarh': 'Chandigarh', 'shimla': 'Shimla',
+    'srinagar': 'Srinagar', 'guwahati': 'Guwahati', 'agra': 'Agra', 'varanasi': 'Varanasi',
+    'rishikesh': 'Rishikesh', 'haridwar': 'Haridwar', 'dehradun': 'Dehradun',
+    'nainital': 'Nainital', 'mussoorie': 'Mussoorie', 'himalayas': 'Himalayas',
+    # Countries / regions
+    'usa': 'USA', 'united states': 'United States', 'uk': 'UK', 'united kingdom': 'United Kingdom',
+    'china': 'China', 'japan': 'Japan', 'russia': 'Russia', 'australia': 'Australia',
+    'canada': 'Canada', 'brazil': 'Brazil', 'pakistan': 'Pakistan', 'nepal': 'Nepal',
+    'bangladesh': 'Bangladesh', 'sri lanka': 'Sri Lanka', 'bhutan': 'Bhutan',
+    'indonesia': 'Indonesia', 'germany': 'Germany', 'france': 'France', 'italy': 'Italy',
+    'spain': 'Spain', 'mexico': 'Mexico', 'south africa': 'South Africa', 'egypt': 'Egypt',
+    'europe': 'Europe', 'asia': 'Asia', 'africa': 'Africa', 'antarctica': 'Antarctica',
+    'arctic': 'Arctic',
+    # Cities abroad
+    'london': 'London', 'paris': 'Paris', 'new york': 'New York', 'tokyo': 'Tokyo',
+    'beijing': 'Beijing', 'sydney': 'Sydney',
+    # Water bodies
+    'indian ocean': 'Indian Ocean', 'pacific ocean': 'Pacific Ocean',
+    'atlantic ocean': 'Atlantic Ocean', 'bay of bengal': 'Bay of Bengal',
+    'arabian sea': 'Arabian Sea',
+    # Worldwide
+    'worldwide': 'Worldwide', 'global': 'Global',
+}
+
+
+def _keyword_regex(words: List[str], allow_plural: bool = True) -> "re.Pattern":
+    """Whole-word regex for a list of words/phrases (longest first)."""
+    parts = []
+    for w in sorted({w.lower() for w in words}, key=len, reverse=True):
+        parts.append(r'\s+'.join(re.escape(tok) for tok in w.split()))
+    plural = r'(?:s|es)?' if allow_plural else ''
+    return re.compile(r'\b(?:' + '|'.join(parts) + r')' + plural + r'\b')
+
+
+def _build_location_patterns() -> List[Tuple["re.Pattern", str]]:
+    patterns = []
+    for loc in sorted(LOCATIONS, key=len, reverse=True):
+        body = r'\s+'.join(re.escape(tok) for tok in loc.split())
+        if loc == 'global':
+            # "global warming" / "global climate" is a topic, not a location
+            body += r'(?!\s+(?:warming|climate|temperature))'
+        patterns.append((re.compile(r'\b' + body + r'\b'), LOCATIONS[loc]))
+    return patterns
+
+
+_ENV_RE = _keyword_regex(PILOT_DOMAIN_KEYWORDS)
+_REJECT_TOPIC_RE = _keyword_regex(REJECTED_TOPIC_WORDS)
+_REJECT_ACCESS_RE = _keyword_regex(REJECTED_ACCESS_WORDS)
+_LOCATION_PATTERNS = _build_location_patterns()
+
+_SIZE_UNITS = r'(?:rows?|samples?|records?|entries|entry|observations?|data\s*points?)'
+_NUMBER = r'(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)'
+_SIZE_RE = re.compile(r'(?<![\d,.])' + _NUMBER + r'\s*([km])?\s*' + _SIZE_UNITS + r'\b')
+_BARE_SIZE_RE = re.compile(r'^\s*' + _NUMBER + r'\s*([km])?\s*(?:' + _SIZE_UNITS + r')?\s*$')
+
+_GRANULARITY_WORDS = {
+    'hourly': 'Hourly', 'daily': 'Daily', 'weekly': 'Weekly', 'monthly': 'Monthly',
+    'quarterly': 'Quarterly', 'yearly': 'Yearly', 'annual': 'Yearly', 'annually': 'Yearly',
+}
+
+
+# ============================================================================
+# LLM OUTPUT SCHEMA (every field optional/defaulted so a null from the small
+# model can never fail the whole call)
+# ============================================================================
+
 class LLMRequirementAnalysis(BaseModel):
     """Schema for LLM analysis output."""
-    domain: str
-    subdomain: Optional[str] = None  # Allow null for general/vague requests
-    problem_type: str
-    data_modality: str
-    expected_features: List[str]  # Input measurements only (real, measurable)
-    target_variable: Optional[str] = None  # For prediction: what to predict
-    topic_description: str
+    domain: Optional[str] = None
+    subdomain: Optional[str] = None  # null for general/vague requests
+    problem_type: str = "analysis"
+    data_modality: str = "tabular"
+    expected_features: List[str] = Field(default_factory=list)  # input measurements only
+    target_variable: Optional[str] = None  # for prediction: what to predict
+    topic_description: str = ""
     time_granularity: Optional[str] = None  # hourly, daily, monthly, etc.
 
 
 class RequirementAnalyzer:
     """
     Requirement Analyzer Agent.
-    
+
     Analyzes user's free-text request and fills RequirementSpec.
-    Uses plain Python for extractables (dates, sizes, formats).
-    Uses LLM only for topic understanding (domain, subdomain, features).
-    
+    Uses plain Python for extractables (dates, sizes, formats, scope).
+    Uses the LLM only for topic understanding (domain, subdomain, features).
+
     Standard entry point: analyze(spec: DatasetSpec) -> DatasetSpec
     """
-    
-    # FIX 2: Supported domains in one config location
-    SUPPORTED_DOMAINS = [
-        'weather', 'climate', 'meteorological',
-        'air quality', 'pollution', 'atmospheric',
-        'fire', 'wildfire',
-        'earthquake', 'seismic',
-        'ocean', 'marine',
-        'satellite', 'remote sensing',
-        'temperature', 'rainfall', 'wind', 'humidity', 'pressure',
-        'flood', 'drought', 'storm', 'cyclone', 'tsunami', 'volcano',
-        'environmental', 'ecological', 'biodiversity',
-        'forest', 'vegetation', 'glacier', 'ice', 'snow',
-        'water quality', 'soil', 'land use',
-        'landslide', 'geological hazards'
-    ]
-    
-    # Clearly unsupported topics (instant rejection)
-    INSTANTLY_REJECTED_KEYWORDS = {
-        # Financial
-        r'\bstock\b', r'\bstocks\b', r'\bprice\b', r'\bprices\b',
-        r'\bmarket\b', r'\bmarkets\b', r'\bfinance\b', r'\bfinancial\b',
-        r'\btrading\b', r'\bcrypto\b', r'\bcryptocurrency\b',
-        # Social media
-        r'\bsocial media\b', r'\btwitter\b', r'\bfacebook\b',
-        r'\binstagram\b', r'\btiktok\b',
-        # Entertainment
-        r'\bmovie\b', r'\bfilm\b', r'\breview\b', r'\brating\b',
-        # Commerce
-        r'\bproduct\b', r'\bshopping\b', r'\becommerce\b', r'\bretail\b',
-        # Medical
-        r'\bmedical\b', r'\bpatient\b', r'\bhospital\b',
-        # Private/restricted
-        r'\bprivate\b', r'\blogin required\b', r'\bpaid\b',
-        r'\bcredential\b', r'\bconfidential\b'
-    }
-    
+
+    # The one config constant for the pilot domain (kept under the old name too)
+    SUPPORTED_DOMAINS = PILOT_DOMAIN_KEYWORDS
+
+    REJECTION_MESSAGE = (
+        f"Not supported yet: your request seems outside our focus on {PILOT_DOMAIN_LABEL} "
+        "(weather, climate, air quality, natural disasters, water/ocean, forests, glaciers, "
+        "satellite-derived data). Please describe a dataset in one of these areas."
+    )
+
     def __init__(self, interactive: bool = False):
         """
-        Initialize analyzer.
-        
         Args:
-            interactive: Whether to prompt user for clarifications (default: False for tests/orchestrator)
+            interactive: Whether to prompt the user for clarifications
+                         (default False for tests/orchestrator).
         """
         self.llm = get_llm()
         self.interactive = interactive
-    
+        self.stats: Dict[str, float] = {}
+        self._reset_stats()
+
+    # ------------------------------------------------------------------
+    # Timing / counters (LLM time and user-wait time are kept separate)
+    # ------------------------------------------------------------------
+
+    def _reset_stats(self):
+        self.stats = {'llm_calls': 0, 'llm_seconds': 0.0, 'user_wait_seconds': 0.0}
+
+    def _call_llm(self, **kwargs):
+        """Every LLM call goes through here so it is counted and timed (also on failure)."""
+        start = time.time()
+        self.stats['llm_calls'] += 1
+        try:
+            return self.llm.call(**kwargs)
+        finally:
+            self.stats['llm_seconds'] += time.time() - start
+
+    def _read_input(self, prompt: str) -> str:
+        """Read one line from the user; time spent waiting is recorded separately."""
+        start = time.time()
+        try:
+            return input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+        finally:
+            self.stats['user_wait_seconds'] += time.time() - start
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
     def analyze(self, spec: DatasetSpec) -> DatasetSpec:
         """
         Standard orchestrator entry point.
-        
+
         Args:
             spec: DatasetSpec with user input in spec.requirement
-            
+
         Returns:
             Updated DatasetSpec with filled RequirementSpec
         """
         print("🔍 Analyzing requirement...")
+        self._reset_stats()
         start_time = time.time()
-        
-        # Extract user input
+
         if not spec.requirement:
             raise ValueError("spec.requirement must be set with dataset_name and description")
-        
+
         dataset_name = spec.requirement.dataset_name
         description = spec.requirement.description
-        
-        # Initial analysis
+
         requirement = self._analyze_requirement(dataset_name, description)
-        
+
         # Bounded clarification (ONE round max, if interactive)
         if self.interactive and requirement.is_supported and requirement.clarification_round == 0:
             requirement = self._bounded_clarification(requirement, dataset_name, description)
-        
-        # Update spec
+
         spec.requirement = requirement
-        if requirement.target_requires_derivation:
+
+        if not requirement.is_supported:
+            spec.pipeline_status = PipelineStatus.REJECTED
+            spec.current_stage = "requirement_rejected"
+            spec.add_warning(f"Request rejected: {requirement.unsupported_reason}")
+            print(f"🚫 {requirement.unsupported_reason}")
+        elif requirement.target_requires_derivation:
             derivation_note = "target must be derived from real events or thresholds"
             if derivation_note not in spec.warnings:
                 spec.add_warning(derivation_note)
-        
-        duration = time.time() - start_time
-        print(f"✅ Requirement analyzed in {duration:.2f}s")
-        logger.info(f"Requirement analysis completed in {duration:.2f}s")
-        
+
+        total = time.time() - start_time
+        wait = self.stats['user_wait_seconds']
+        llm_s = self.stats['llm_seconds']
+        processing = max(0.0, total - wait - llm_s)
+        print(
+            f"✅ Requirement analyzed in {total:.2f}s "
+            f"(LLM {llm_s:.2f}s over {int(self.stats['llm_calls'])} call(s), "
+            f"waiting for you {wait:.2f}s, other processing {processing:.2f}s)"
+        )
+        logger.info(
+            f"Requirement analysis: total={total:.2f}s llm={llm_s:.2f}s "
+            f"llm_calls={int(self.stats['llm_calls'])} user_wait={wait:.2f}s"
+        )
+
         return spec
-    
+
+    # ------------------------------------------------------------------
+    # Main analysis
+    # ------------------------------------------------------------------
+
     def _analyze_requirement(self, dataset_name: str, description: str) -> RequirementSpec:
-        """
-        Main analysis logic.
-        
-        Args:
-            dataset_name: Name of dataset
-            description: User's free-text description
-            
-        Returns:
-            Filled RequirementSpec
-        """
-        # FIX 1: Combine dataset_name and description for extraction
+        """Main analysis logic. Returns a filled RequirementSpec."""
         combined = f"{dataset_name} {description}".lower()
-        
-        # Track what's explicit vs inferred
-        explicitly_stated = []
-        inferred_by_model = []
-        missing_or_unclear = []
-        clarifying_questions = []
-        
-        # 1. Extract simple fields with regex/rules
+
+        explicitly_stated: List[str] = []
+        inferred_by_model: List[str] = []
+        missing_or_unclear: List[str] = []
+        clarifying_questions: List[str] = []
+
+        # 1. Simple fields with regex/rules
         output_format = self._extract_output_format(combined, explicitly_stated, inferred_by_model)
         expected_size = self._extract_size(combined, explicitly_stated, inferred_by_model)
         freshness_need, max_data_age = self._extract_freshness(
@@ -158,12 +314,11 @@ class RequirementAnalyzer:
         time_range = self._extract_time_range(combined, explicitly_stated, inferred_by_model)
         geography = self._extract_geography(combined, explicitly_stated, inferred_by_model)
         constraints = self._extract_constraints(combined, explicitly_stated)
-        
-        # 2. Check if request is in scope (environmental/nature focus)
+
+        # 2. Scope check (instant, no LLM)
         is_supported, unsupported_reason = self._check_support(combined)
-        
+
         if not is_supported:
-            # Return early with unsupported flag
             return RequirementSpec(
                 dataset_name=dataset_name,
                 description=description,
@@ -173,73 +328,78 @@ class RequirementAnalyzer:
                 explicitly_stated=explicitly_stated,
                 inferred_by_model=inferred_by_model
             )
-        
-        # 3. Use LLM for topic understanding
-        llm_result = self._analyze_with_llm(dataset_name, description, combined)
-        
-        # Map data modality
+
+        # 3. LLM for topic understanding (rule-based fallback on ANY failure)
+        try:
+            llm_result = self._analyze_with_llm(dataset_name, description, combined)
+        except Exception as e:
+            logger.error(f"LLM analysis failed: {e}. Using rule-based fallback.")
+            print(f"⚠️  LLM analysis unavailable: {e}. Using rule-based fallback.")
+            llm_result = self._extract_topic_with_rules(combined, description)
+
+        llm_result.subdomain = self._clean_subdomain(llm_result.subdomain, combined)
         data_modality = self._map_data_modality(llm_result.data_modality)
-        
-        # Build expected features (input measurements only)
+
         expected_features = llm_result.expected_features
         target_variable = llm_result.target_variable
-        
-        # Check if target variable requires derivation (not directly measurable)
+
+        # Does the target need to be derived (not directly measurable)?
         target_requires_derivation = False
         target_terms = ['risk', 'occurrence', 'category', 'index', 'severity', 'defined', 'derived', 'prediction']
         if target_variable and any(k in target_variable.lower() for k in target_terms):
             target_requires_derivation = True
         elif any(k in combined for k in ['flood risk', 'flood occurrence', 'fire risk', 'fire occurrence', 'landslide risk']):
             target_requires_derivation = True
-        
-        if target_requires_derivation:
-            derivation_note = "target must be derived from real events or thresholds"
-            if derivation_note not in missing_or_unclear:
-                missing_or_unclear.append(derivation_note)
-        
-        # Add to tracking
+        # NOTE: the derivation note is a warning on the spec (added in analyze()),
+        # NOT a "missing information" item.
+
         inferred_by_model.extend(['domain', 'subdomain', 'problem_type', 'data_modality'])
         if expected_features:
             inferred_by_model.append('expected_features')
         if target_variable:
             inferred_by_model.append('target_variable')
-        
-        # FIX 2: Add clarifying question about time granularity for long ranges
-        if time_range and not llm_result.time_granularity:
-            # Check if it's a multi-year range
-            if 'to' in time_range and any(char.isdigit() for char in time_range):
-                # Extract years if possible
-                years = [int(s) for s in time_range.split() if s.isdigit() and len(s) == 4]
-                if len(years) >= 2 and (years[-1] - years[0]) > 1:
-                    clarifying_questions.append(
-                        "What time granularity do you need? (e.g., hourly, daily, monthly)"
-                    )
-                    missing_or_unclear.append('time granularity')
-        
-        # FIX 3: Check if time range extends to present/future
-        current_year = 2026  # Based on system date
-        if time_range and str(current_year) in time_range:
-            # Time range includes current year or future
+
+        # Prediction request whose target must be derived but the model named none:
+        # keep an explicit placeholder so later agents know it still has to be defined.
+        if target_requires_derivation and not target_variable and llm_result.problem_type == "prediction":
+            target_variable = "to be defined from real data"
+            inferred_by_model.append('target_variable: to be defined from real data (placeholder)')
+
+        # Ask about granularity for multi-year ranges, unless the user already said it
+        span = self._year_span(time_range)
+        if span and (span[1] - span[0]) > 1:
+            if not llm_result.time_granularity and not self._extract_granularity(combined):
+                clarifying_questions.append(
+                    "What time granularity do you need? (e.g., hourly, daily, monthly)"
+                )
+                missing_or_unclear.append('time granularity')
+
+        # Time range reaches the present -> must include the latest available data
+        current_year = datetime.now().year
+        if span and span[1] >= current_year:
             constraints.append('must cover up to latest available date')
             explicitly_stated.append('constraint: must cover up to latest available date')
-        
-        # 4. Check for missing critical information
-        if not geography and 'location' not in missing_or_unclear:
+
+        # Missing critical information
+        if not geography and 'geographic area' not in missing_or_unclear:
             missing_or_unclear.append('geographic area')
             clarifying_questions.append("Which geographic area or location do you need?")
-        
+
         if not expected_size:
             missing_or_unclear.append('dataset size')
-        
-        # 5. Calculate completeness
+
         completeness = self._calculate_confidence(
             explicitly_stated, missing_or_unclear, is_supported
         )
-        
-        # Build RequirementSpec
+
+        topic_summary = (llm_result.topic_description or "").strip() or None
+        if topic_summary and topic_summary == description.strip():
+            topic_summary = None  # nothing new (rule-based fallback echoes the user's text)
+
         return RequirementSpec(
             dataset_name=dataset_name,
-            description=llm_result.topic_description or description,
+            description=description,          # the USER's text is never overwritten
+            topic_summary=topic_summary,      # the LLM's summary lives in its own field
             domain=llm_result.domain,
             subdomain=llm_result.subdomain,
             problem_type=llm_result.problem_type,
@@ -262,112 +422,136 @@ class RequirementAnalyzer:
             clarifying_questions=clarifying_questions,
             completeness=completeness
         )
-    
+
+    # ------------------------------------------------------------------
+    # Rule-based extraction
+    # ------------------------------------------------------------------
+
     def _extract_output_format(
         self, text: str, explicitly_stated: List[str], inferred: List[str]
     ) -> str:
         """Extract output format from text."""
-        if 'excel' in text or '.xlsx' in text or '.xls' in text:
+        if re.search(r'\bexcel\b|\bxlsx?\b', text):
             explicitly_stated.append('output_format: excel')
             return 'excel'
-        elif 'json' in text:
+        elif re.search(r'\bjson\b', text):
             explicitly_stated.append('output_format: json')
             return 'json'
-        elif 'csv' in text:
+        elif re.search(r'\bcsv\b', text):
             explicitly_stated.append('output_format: csv')
             return 'csv'
         else:
             inferred.append('output_format: csv (default)')
             return 'csv'
-    
+
+    @staticmethod
+    def _to_count(number: str, suffix: Optional[str]) -> int:
+        """'1,000' -> 1000, '10' + 'k' -> 10000, '1.5' + 'k' -> 1500."""
+        value = float(number.replace(',', ''))
+        if suffix == 'k':
+            value *= 1_000
+        elif suffix == 'm':
+            value *= 1_000_000
+        return int(round(value))
+
     def _extract_size(
         self, text: str, explicitly_stated: List[str], inferred: List[str]
-    ) -> str:
-        """Extract expected dataset size."""
-        # Look for patterns like "5000 rows", "1000 samples", "10k records"
-        patterns = [
-            r'(\d+k?)\s*(rows|samples|records|entries|observations)',
-            r'about\s+(\d+k?)\s+',
-            r'(\d+k?)\s+rows'
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                size = match.group(1)
-                explicitly_stated.append(f'dataset_size: {size}')
-                return f"{size} rows"
-        
+    ) -> Optional[str]:
+        """
+        Extract expected dataset size. A number only counts when it is directly
+        followed by a size word (rows, samples, records, entries, observations,
+        data points), so "about 10 years" is NOT a size.
+        """
+        match = _SIZE_RE.search(text)
+        if match:
+            count = self._to_count(match.group(1), match.group(2))
+            if count > 0:
+                explicitly_stated.append(f'dataset_size: {count}')
+                return f"{count} rows"
         return None
-    
+
+    def _parse_size_text(self, text: str) -> Optional[int]:
+        """Parse a size the user TYPED: '2000', '2,000', '2k', '2000 rows'."""
+        text = text.lower().strip()
+        match = _BARE_SIZE_RE.match(text) or _SIZE_RE.search(text)
+        if match:
+            count = self._to_count(match.group(1), match.group(2))
+            return count if count > 0 else None
+        return None
+
+    def _extract_granularity(self, text: str) -> Optional[str]:
+        """Time granularity the user already stated (hourly, daily, monthly, ...)."""
+        for word, label in _GRANULARITY_WORDS.items():
+            if re.search(rf'\b{word}\b', text):
+                return label
+        return None
+
+    @staticmethod
+    def _year_span(time_range: Optional[str]) -> Optional[Tuple[int, int]]:
+        """(first_year, last_year) of a range like '2020 to 2026', else None."""
+        if not time_range:
+            return None
+        years = [int(y) for y in re.findall(r'\b(\d{4})\b', time_range)]
+        if len(years) >= 2:
+            return years[0], years[-1]
+        return None
+
     def _extract_freshness(
         self, text: str, explicitly_stated: List[str], inferred: List[str],
         missing: List[str], questions: List[str]
-    ) -> Tuple[str, str]:
+    ) -> Tuple[str, Optional[str]]:
         """
         Extract freshness need and max data age.
-        
+
         max_data_age = how old the NEWEST record may be
-        - For "live": infer "1 hour" (data must be very fresh)
-        - For "recent": infer "24 hours" (data should be recent)
-        - For historical/unspecified: leave empty
-        
-        Note: Time windows like "last 7 days" go to time_range, not max_data_age
+        - "live": infer "1 hour"
+        - "recent": infer "24 hours"
+        - historical/unspecified: empty
+
+        Time windows like "last 7 days" go to time_range, not max_data_age.
         """
         freshness = "unspecified"
         max_age = None
-        
-        # Check for live/real-time using word boundaries
+
         live_patterns = [r'\blive\b', r'\breal-time\b', r'\brealtime\b', r'\breal time\b']
         if any(re.search(pattern, text) for pattern in live_patterns):
             freshness = "live"
             explicitly_stated.append('freshness: live')
-            # For live, infer max_data_age if not specified
             max_age = "1 hour"
             inferred.append('max_data_age: 1 hour (inferred for live data)')
-        # Check for recent/current/latest
         elif any(re.search(rf'\b{word}\b', text) for word in ['recent', 'current', 'latest', 'now']):
             freshness = "recent"
             explicitly_stated.append('freshness: recent')
-            # For recent, infer max_data_age if not specified
             max_age = "24 hours"
             inferred.append('max_data_age: 24 hours (inferred for recent data)')
             missing.append('specific time window')
             questions.append("How recent? (e.g., last 24 hours, last 7 days)")
-        # Check for historical/past/archive
         elif any(re.search(rf'\b{word}\b', text) for word in ['historical', 'past', 'archive']):
             freshness = "historical"
             explicitly_stated.append('freshness: historical')
-        # Check if there's a year range (like 2010 to 2020) - implies historical
-        elif 'from' in text and 'to' in text:
-            if re.search(r'from\s+\d{4}\s+to\s+\d{4}', text):
-                freshness = "historical"
-                explicitly_stated.append('freshness: historical (inferred from year range)')
-        
+        elif re.search(r'from\s+\d{4}\s+to\s+\d{4}', text):
+            freshness = "historical"
+            explicitly_stated.append('freshness: historical (inferred from year range)')
+
         if freshness == "unspecified":
             inferred.append('freshness: unspecified (not specified)')
-        
+
         return freshness, max_age
-    
+
     def _extract_time_range(
         self, text: str, explicitly_stated: List[str], inferred: List[str]
-    ) -> str:
+    ) -> Optional[str]:
         """
         Extract time range (history window).
-        
-        Examples:
-        - "last 7 days" → time_range
-        - "from 2010 to 2020" → time_range  
-        - "this month" → time_range
-        - "past 30 days" → time_range
+
+        Examples: "last 7 days", "from 2010 to 2020", "this month", "past 30 days".
         """
-        # Time window patterns (last X days/weeks/months/years)
         window_patterns = [
             r'last\s+(\d+)\s+(hour|day|week|month|year)s?',
             r'past\s+(\d+)\s+(hour|day|week|month|year)s?',
             r'previous\s+(\d+)\s+(hour|day|week|month|year)s?',
         ]
-        
+
         for pattern in window_patterns:
             match = re.search(pattern, text)
             if match:
@@ -376,306 +560,215 @@ class RequirementAnalyzer:
                 time_range = f"last {num} {unit}s" if int(num) > 1 else f"last {num} {unit}"
                 explicitly_stated.append(f'time_range: {time_range}')
                 return time_range
-        
-        # Year range patterns
+
         year_patterns = [
             r'from\s+(\d{4})\s+to\s+(\d{4})',
             r'(\d{4})\s*-\s*(\d{4})',
             r'(\d{4})\s+to\s+(\d{4})',
         ]
-        
+
         for pattern in year_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 time_range = f"{match.group(1)} to {match.group(2)}"
                 explicitly_stated.append(f'time_range: {time_range}')
                 return time_range
-        
-        # Relative patterns
+
+        months = ('january|february|march|april|may|june|july|august|'
+                  'september|october|november|december')
         relative_patterns = [
             (r'this\s+(week|month|year)', lambda m: f"this {m.group(1)}"),
             (r'last\s+(week|month|year)', lambda m: f"last {m.group(1)}"),
-            (r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+to\s+(january|february|march|april|may|june|july|august|september|october|november|december)', lambda m: f"{m.group(1)} to {m.group(2)}"),
+            (rf'({months})\s+to\s+({months})', lambda m: f"{m.group(1)} to {m.group(2)}"),
         ]
-        
+
         for pattern, formatter in relative_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 time_range = formatter(match)
                 explicitly_stated.append(f'time_range: {time_range}')
                 return time_range
-        
+
         return None
-    
+
     def _extract_geography(
         self, text: str, explicitly_stated: List[str], inferred: List[str]
-    ) -> str:
-        """Extract geographic area."""
-        # Common patterns
-        geo_patterns = [
-            r'in\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',  # "in Delhi", "in New York"
-            r'for\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',  # "for India"
-            r'of\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',  # "of Rishikesh"
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+region',  # "Kerala region"
-        ]
-        
-        # Extended list of locations (countries, Indian states, major cities)
-        locations = [
-            # India and states
-            'delhi', 'india', 'kerala', 'mumbai', 'bangalore', 'chennai', 'kolkata',
-            'rajasthan', 'maharashtra', 'karnataka', 'tamil nadu', 'gujarat', 
-            'west bengal', 'uttar pradesh', 'punjab', 'haryana', 'uttarakhand',
-            'rishikesh', 'haridwar', 'dehradun', 'nainital', 'mussoorie',
-            # Global
-            'usa', 'china', 'europe', 'asia', 'africa', 'worldwide', 'global',
-            'australia', 'canada', 'brazil', 'japan', 'uk', 'russia'
-        ]
-        
-        for loc in locations:
-            if loc in text:
-                geography = loc.title()
-                explicitly_stated.append(f'geography: {geography}')
-                return geography
-        
-        # Try patterns
-        for pattern in geo_patterns:
-            match = re.search(pattern, text)
-            if match:
-                geography = match.group(1)
-                explicitly_stated.append(f'geography: {geography}')
-                return geography
-        
+    ) -> Optional[str]:
+        """
+        Extract geographic area by WHOLE-WORD match against LOCATIONS
+        ("usa" does not match "thousand", "uk" does not match "ukraine").
+        Unknown places are not guessed; the user is asked instead.
+        """
+        text = text.lower()
+        for pattern, display in _LOCATION_PATTERNS:   # longest names first
+            if pattern.search(text):
+                explicitly_stated.append(f'geography: {display}')
+                return display
         return None
-    
+
     def _extract_constraints(self, text: str, explicitly_stated: List[str]) -> List[str]:
         """Extract constraints."""
         constraints = []
-        
-        if 'free' in text and ('source' in text or 'data' in text):
+
+        if re.search(r'\bfree\b', text) and ('source' in text or 'data' in text):
             constraints.append('free sources only')
             explicitly_stated.append('constraint: free sources')
-        
+
         if 'no login' in text or 'without login' in text:
             constraints.append('no login required')
             explicitly_stated.append('constraint: no login')
-        
-        if 'public' in text and 'data' in text:
+
+        if re.search(r'\bpublic\b', text) and 'data' in text:
             constraints.append('public data only')
             explicitly_stated.append('constraint: public data')
-        
-        # Satellite/remote sensing data
-        satellite_keywords = ['satellite', 'satellites', 'remote sensing', 'imagery-derived', 
-                             'satellite-derived', 'orbital', 'space-based']
-        if any(keyword in text for keyword in satellite_keywords):
+
+        if re.search(r'\bsatellites?\b|\bremote sensing\b|\bimagery-derived\b|'
+                     r'\bsatellite-derived\b|\borbital\b|\bspace-based\b', text):
             constraints.append('satellite-derived data')
             explicitly_stated.append('constraint: satellite-derived data')
-        
+
         return constraints
-    
-    def _check_support(self, text: str) -> Tuple[bool, str]:
+
+    # ------------------------------------------------------------------
+    # Scope check (pilot domain). Instant, never calls the LLM.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_negated(text: str, start: int) -> bool:
+        """True if one of the 3 words before position `start` is a negator."""
+        words = re.findall(r"[a-z']+", text[:start])[-3:]
+        return any(w in _NEGATORS for w in words)
+
+    def _check_support(self, text: str) -> Tuple[bool, Optional[str]]:
         """
-        Check if request is in scope.
-        
-        FIX 2: Two-tier checking:
-        1. Instant rejection for clearly unsupported (finance, social, private)
-        2. LLM check for ambiguous cases (no env keywords, but not clearly rejected)
-        
-        Returns:
-            (is_supported, unsupported_reason)
+        Is the request inside the pilot domain?
+
+        1. clearly out-of-scope topic (finance, social media, ...) -> reject
+        2. restricted access (private/paid/login) unless negated    -> reject
+        3. at least one pilot-domain keyword (whole word)           -> supported
+        4. otherwise                                                -> reject
+
+        Returns: (is_supported, unsupported_reason)
         """
-        # Check for instant rejection keywords
-        for pattern in self.INSTANTLY_REJECTED_KEYWORDS:
-            if re.search(pattern, text, re.IGNORECASE):
-                # Special case: allow "livestock" even though it has "stock"
-                if 'livestock' in text and pattern in [r'\bstock\b', r'\bstocks\b']:
-                    continue
-                
-                return False, (
-                    f"Not supported yet. "
-                    f"Currently supported: {', '.join(sorted(set([d.split()[0] for d in self.SUPPORTED_DOMAINS[:10]])))}, "
-                    f"and other environmental/nature data."
-                )
-        
-        # Check for environmental keywords
-        has_env_keyword = any(keyword in text for keyword in self.SUPPORTED_DOMAINS)
-        
-        if has_env_keyword:
+        text = text.lower()
+
+        if _REJECT_TOPIC_RE.search(text):
+            return False, self.REJECTION_MESSAGE
+
+        for match in _REJECT_ACCESS_RE.finditer(text):
+            if not self._is_negated(text, match.start()):
+                return False, self.REJECTION_MESSAGE
+
+        if _ENV_RE.search(text):
             return True, None
-        
-        # FIX 2b: No env keywords and not instantly rejected -> Ask LLM
-        logger.info("No environmental keywords found. Asking LLM to check scope...")
-        try:
-            return self._check_support_with_llm(text)
-        except Exception as e:
-            logger.error(f"LLM scope check failed: {e}. Defaulting to rejection.")
-            return False, (
-                f"Not supported yet. "
-                f"Currently supported: weather, climate, air quality, natural disasters, "
-                f"water/ocean data, forests, glaciers, and other environmental/nature data."
-            )
-    
-    def _check_support_with_llm(self, text: str) -> Tuple[bool, str]:
+
+        return False, self.REJECTION_MESSAGE
+
+    # ------------------------------------------------------------------
+    # LLM topic understanding
+    # ------------------------------------------------------------------
+
+    def _parse_llm_payload(self, content: Any) -> LLMRequirementAnalysis:
+        """Turn the LLM's JSON into LLMRequirementAnalysis; nulls never fail the call."""
+        if isinstance(content, LLMRequirementAnalysis):
+            return content
+        if not isinstance(content, dict):
+            raise ValueError(f"LLM returned {type(content).__name__}, expected a JSON object")
+
+        data = dict(content)
+        for key in ('problem_type', 'data_modality', 'topic_description'):
+            if data.get(key) is None:
+                data.pop(key, None)          # fall back to the schema default
+        features = data.get('expected_features')
+        if features is None:
+            data['expected_features'] = []
+        elif isinstance(features, str):
+            data['expected_features'] = [f.strip() for f in features.split(',') if f.strip()]
+        else:
+            data['expected_features'] = [str(f) for f in features if f]
+
+        result = LLMRequirementAnalysis(**data)
+
+        if result.subdomain and result.subdomain.lower() in ['general', 'unspecified', 'various', 'weather']:
+            result.subdomain = None
+        return result
+
+    def _clean_subdomain(self, subdomain: Optional[str], combined: str) -> Optional[str]:
         """
-        Use LLM to determine if ambiguous request is related to supported domains.
-        
-        Args:
-            text: The request text
-            
-        Returns:
-            (is_supported, unsupported_reason)
+        A subdomain names a phenomenon ("flood monitoring"), never a place or a year.
+        If the model copied one in ("Rishikesh Rainfall"), use the keyword-based
+        subdomain instead, or strip the place/year words.
         """
-        prompt = f"""Is this dataset request about NATURAL environmental or earth science phenomena?
+        if not subdomain:
+            return None
+        lowered = subdomain.lower()
+        has_place = any(pattern.search(lowered) for pattern, _ in _LOCATION_PATTERNS)
+        has_year = re.search(r'\b\d{4}\b', lowered) is not None
+        if not (has_place or has_year):
+            return subdomain
 
-Request: "{text}"
+        fallback = self._extract_topic_with_rules(combined, "").subdomain
+        if fallback:
+            return fallback
 
-SUPPORTED domains (natural/environmental):
-- Weather, climate, atmospheric conditions (rain, wind, temperature)
-- Natural disasters: earthquakes, volcanic eruptions, tsunamis, floods, wildfires, landslides, droughts
-- Water bodies: rivers, oceans, lakes, water quality
-- Land features: forests, vegetation, soil, glaciers, snow, ice
-- Satellite/remote sensing of NATURAL features (not human activities)
-- Ecological data: biodiversity, wildlife, ecosystems
+        stripped = lowered
+        for pattern, _ in _LOCATION_PATTERNS:
+            stripped = pattern.sub('', stripped)
+        stripped = re.sub(r'\b\d{4}\b', '', stripped)
+        stripped = ' '.join(stripped.split())
+        return stripped or None
 
-NOT SUPPORTED (human-focused):
-- Human safety/accidents (traffic, workplace, industrial accidents)
-- Human infrastructure (buildings, roads, urban planning)
-- Human health/medical data
-- Economic/financial data
-- Social data
-
-Key question: Is the request about NATURAL phenomena or about HUMAN activities/safety?
-
-Answer in JSON with:
-1. "is_related": true ONLY if clearly about natural/environmental phenomena, false otherwise
-2. "confidence": "high", "medium", or "low"
-3. "reasoning": one sentence explaining
-
-Examples:
-- "accident risk prediction" -> {{"is_related": false, "confidence": "high", "reasoning": "Accidents are human safety events, not natural environmental phenomena"}}
-- "glacier retreat" -> {{"is_related": true, "confidence": "high", "reasoning": "Glaciers are natural earth features studied in climate science"}}
-- "landslide events" -> {{"is_related": true, "confidence": "high", "reasoning": "Landslides are natural geological hazards"}}
-- "traffic accidents" -> {{"is_related": false, "confidence": "high", "reasoning": "Traffic accidents are human safety, not environmental data"}}
-
-Return JSON only:"""
-        
-        try:
-            response = self.llm.call(
-                prompt=prompt,
-                expected_schema=None,
-                force_json=True
-            )
-            
-            result = response.content
-            is_related = result.get('is_related', False)
-            confidence = result.get('confidence', 'low')
-            reasoning = result.get('reasoning', '')
-            
-            logger.info(f"LLM scope check: is_related={is_related}, confidence={confidence}")
-            logger.info(f"LLM reasoning: {reasoning}")
-            
-            if is_related:
-                return True, None
-            else:
-                return False, (
-                    f"Not supported yet. "
-                    f"Currently supported: weather, climate, air quality, natural disasters "
-                    f"(earthquakes, floods, fires, landslides), water/ocean data, glaciers, "
-                    f"forests, vegetation, satellite/remote sensing of nature, and other "
-                    f"environmental data. {reasoning}"
-                )
-                
-        except Exception as e:
-            logger.error(f"LLM scope check failed: {e}")
-            # On error, reject conservatively but mention it's uncertain
-            return False, (
-                f"Could not determine if this request is supported. "
-                f"Currently supported: environmental and nature data (weather, climate, "
-                f"natural disasters, water, land, forests, etc.)."
-            )
-    
     def _analyze_with_llm(self, dataset_name: str, description: str, combined: str) -> LLMRequirementAnalysis:
-        """Use LLM for topic understanding."""
-        prompt = f"""Analyze this dataset request and return ONLY JSON:
+        """Use the LLM for topic understanding (falls back to rules on failure)."""
+        prompt = f"""Analyze this dataset request and return ONLY a JSON object.
 
-Dataset: {dataset_name}
+Dataset name: {dataset_name}
 Description: {description}
 
-Determine:
-1. domain: broad category (e.g., "environmental", "meteorological", "seismic")
-2. subdomain: specific area if clearly stated (e.g., "air quality", "earthquakes", "flood monitoring"). Return null if not specific or just general weather/environmental data.
-3. problem_type: what will be done with data (e.g., "monitoring", "prediction", "analysis")
-4. data_modality: "tabular", "text", or "time_series"
-5. expected_features: list of 3-6 INPUT MEASUREMENTS that real public data sources actually record
-   - ONLY suggest directly measurable variables (rainfall, temperature, river discharge, water level, soil moisture, wind speed, etc.)
-   - DO NOT invent computed indices or risk scores
-   - DO NOT list year/month/day/hour separately - use "timestamp" for temporal data
-   - Return EMPTY LIST if you cannot suggest realistic measurements
-6. target_variable: for prediction problems, what is being predicted (e.g., "flood occurrence", "air quality category"). Set to null for monitoring/analysis problems or if the target cannot be directly measured (then note "to be defined from real data").
-7. time_granularity: if a multi-year range is mentioned, suggest appropriate granularity (hourly/daily/monthly). Otherwise null.
-8. topic_description: clear 1-sentence description
-
-Example response for prediction:
+Return exactly these keys:
 {{
-  "domain": "environmental",
-  "subdomain": "flood monitoring",
-  "problem_type": "prediction",
-  "data_modality": "time_series",
-  "expected_features": ["timestamp", "rainfall", "river_water_level", "discharge", "temperature"],
-  "target_variable": "to be defined from real data",
-  "time_granularity": "daily",
-  "topic_description": "Flood risk prediction based on meteorological and hydrological measurements"
+  "domain": "<ONE word chosen from: environmental, meteorological, geological, oceanographic, hydrological>",
+  "subdomain": "<the natural phenomenon or topic only, never a place name or a year; null if the request is general>",
+  "problem_type": "<one of: monitoring, prediction, analysis>",
+  "data_modality": "<one of: tabular, time_series, text>",
+  "expected_features": ["<measurement>", "<measurement>"],
+  "target_variable": "<what is predicted, or null>",
+  "time_granularity": "<one of: hourly, daily, monthly, yearly, or null>",
+  "topic_description": "<one sentence in your own words>"
 }}
 
-Example for monitoring:
-{{
-  "domain": "environmental",
-  "subdomain": "air quality",
-  "problem_type": "monitoring",
-  "data_modality": "time_series",
-  "expected_features": ["timestamp", "pm2.5", "pm10", "aqi", "location"],
-  "target_variable": null,
-  "time_granularity": null,
-  "topic_description": "Real-time air quality measurements including PM2.5 and AQI values"
-}}
-
-For vague requests like "some weather data", return subdomain as null.
+Rules:
+- expected_features: 3 to 6 INPUT MEASUREMENTS that real public data sources record directly.
+  Do not invent computed indices or risk scores. Do not list year, month, day or hour separately;
+  use "timestamp" for time. Use an empty list if you cannot name realistic measurements.
+- target_variable: only for prediction problems. If the target cannot be measured directly,
+  write exactly: to be defined from real data. Otherwise null.
+- time_granularity: only if the request covers several years, otherwise null.
+- subdomain: name the phenomenon or topic only. Never put a place name or a year in it.
 
 Return JSON only:"""
-        
+
         try:
-            response = self.llm.call(
-                prompt=prompt,
-                expected_schema=LLMRequirementAnalysis
-            )
-            
-            result = LLMRequirementAnalysis(**response.content)
-            
-            # Clean up subdomain - replace "general", "weather" or empty with None
-            if result.subdomain and result.subdomain.lower() in ['general', 'unspecified', 'various', 'weather']:
-                result.subdomain = None
-            
-            return result
-            
+            response = self._call_llm(prompt=prompt, expected_schema=LLMRequirementAnalysis)
+            return self._parse_llm_payload(response.content)
         except Exception as e:
-            logger.error(f"LLM analysis failed or timed out: {e}. Using rule-based fallback.")
+            logger.error(f"LLM analysis failed or unusable: {e}. Using rule-based fallback.")
             print(f"⚠️  LLM analysis unavailable: {e}. Using rule-based fallback.")
             return self._extract_topic_with_rules(combined, description)
-    
+
     def _extract_topic_with_rules(self, text: str, description: str) -> LLMRequirementAnalysis:
         """
-        Rule-based topic understanding when LLM call fails or times out.
-        Reuses SUPPORTED_DOMAINS with whole-word regex matching.
+        Rule-based topic understanding when the LLM call fails or times out.
+        Whole-word matching only.
         """
         text_lower = text.lower()
-        
+
         domain = None
         subdomain = None
-        
+
         def has_word(kw: str) -> bool:
-            pattern = r'\b' + re.escape(kw.lower()) + r'\b'
-            return bool(re.search(pattern, text_lower))
-        
-        # Whole-word domain & subdomain mapping using SUPPORTED_DOMAINS
+            return bool(re.search(r'\b' + re.escape(kw.lower()) + r'(?:s|es)?\b', text_lower))
+
         if any(has_word(kw) for kw in ['air quality', 'pollution', 'water quality']):
             domain = "environmental"
             subdomain = "air quality" if (has_word('air quality') or has_word('pollution')) else "water quality"
@@ -694,24 +787,25 @@ Return JSON only:"""
         elif any(has_word(kw) for kw in ['satellite', 'remote sensing']):
             domain = "environmental"
             subdomain = "satellite data"
-        elif any(has_word(kw) for kw in ['weather', 'climate', 'meteorological', 'temperature', 'rainfall', 'wind', 'humidity', 'pressure', 'storm', 'cyclone', 'drought']):
+        elif any(has_word(kw) for kw in ['weather', 'climate', 'meteorological', 'temperature', 'rain', 'rainfall',
+                                         'precipitation', 'monsoon', 'wind', 'humidity', 'storm', 'cyclone', 'drought']):
             domain = "meteorological"
-            subdomain = None  # General weather keeps domain=meteorological and leave subdomain empty (null)
+            subdomain = None  # general weather: domain only, subdomain stays null
         elif any(has_word(kw) for kw in self.SUPPORTED_DOMAINS):
             domain = "environmental"
             subdomain = None
-        
-        # Problem type whole-word matching
+        # domain may stay None: the schema allows it and the clarification step asks for the topic
+
         problem_type = "analysis"
         if any(has_word(kw) for kw in ['predict', 'prediction', 'forecast', 'forecasting', 'model', 'modeling']):
             problem_type = "prediction"
         elif any(has_word(kw) for kw in ['monitor', 'monitoring', 'real-time', 'live', 'track', 'tracking']):
             problem_type = "monitoring"
-            
+
         data_modality = "tabular"
         if any(has_word(kw) for kw in ['time', 'daily', 'hourly', 'live', 'recent', 'series']):
             data_modality = "time_series"
-            
+
         return LLMRequirementAnalysis(
             domain=domain,
             subdomain=subdomain,
@@ -720,9 +814,9 @@ Return JSON only:"""
             expected_features=[],
             topic_description=description
         )
-    
-    def _map_data_modality(self, llm_modality: str) -> DataModality:
-        """Map LLM modality string to DataModality enum."""
+
+    def _map_data_modality(self, llm_modality: Optional[str]) -> DataModality:
+        """Map LLM modality string to DataModality enum (default: tabular)."""
         modality_map = {
             'tabular': DataModality.TABULAR,
             'text': DataModality.TEXT,
@@ -730,98 +824,77 @@ Return JSON only:"""
             'time-series': DataModality.TIME_SERIES,
             'timeseries': DataModality.TIME_SERIES,
         }
-        
-        return modality_map.get(llm_modality.lower().replace(' ', '_'), DataModality.TABULAR)
-    
+        if not llm_modality:
+            return DataModality.TABULAR
+        return modality_map.get(llm_modality.lower().strip().replace(' ', '_'), DataModality.TABULAR)
+
     def _calculate_confidence(
         self, explicitly_stated: List[str], missing: List[str], is_supported: bool
     ) -> float:
         """
-        Calculate completeness score (how much detail the user provided).
-        
-        This measures request completeness, NOT model accuracy.
-        
-        Formula:
-        - Base: 0.50 (has identifiable domain)
-        - 4+ explicit: +0.30 → 0.75-0.80 (clear, detailed request)
-        - 3 explicit: +0.20 → 0.65-0.70 (good detail)
-        - 2 explicit: +0.10 → 0.50-0.60 (some detail)
-        - 1 explicit: +0.05 → 0.45-0.55 (minimal detail)
-        - 0 explicit: -0.30 → 0.10-0.20 (very vague)
-        - Each missing: -0.05 (small penalty for gaps)
-        
-        Args:
-            explicitly_stated: List of explicitly stated items
-            missing: List of missing items
-            is_supported: Whether request is supported
-            
-        Returns:
-            Completeness score (0.0 to 1.0)
+        Completeness score (how much detail the user provided, NOT model accuracy).
+
+        - Base 0.50
+        - 4+ explicit +0.30, 3 explicit +0.20, 2 explicit +0.10, 1 explicit +0.05, 0 explicit -0.30
+        - each missing item -0.05
         """
         if not is_supported:
             return 0.0
-        
-        # Start with base (request is understandable)
+
         score = 0.50
-        
-        # Increase for explicit information
+
         num_explicit = len(explicitly_stated)
         if num_explicit >= 4:
-            score += 0.30  # Clear, detailed
+            score += 0.30
         elif num_explicit >= 3:
-            score += 0.20  # Good detail
+            score += 0.20
         elif num_explicit >= 2:
-            score += 0.10  # Some detail  
+            score += 0.10
         elif num_explicit >= 1:
-            score += 0.05  # Minimal detail
+            score += 0.05
         else:
-            score -= 0.30  # Very vague
-        
-        # Small penalty for missing non-critical information
+            score -= 0.30
+
         score -= len(missing) * 0.05
-        
+
         return max(0.0, min(1.0, score))
-    
+
+    # ------------------------------------------------------------------
+    # Clarification (ONE round, max 4 questions)
+    # ------------------------------------------------------------------
+
     def _bounded_clarification(
-        self, 
-        requirement: RequirementSpec, 
-        dataset_name: str, 
+        self,
+        requirement: RequirementSpec,
+        dataset_name: str,
         description: str
     ) -> RequirementSpec:
         """
-        Ask user for missing critical information (ONE round, max 4 questions).
-        
+        Ask the user for missing critical information (ONE round, max 4 questions).
+
         Priority:
-        1. Topic/target if unclear
+        1. Topic, ONLY if no domain was found
         2. Location
         3. Time range or freshness (+ granularity for long ranges)
         4. Dataset size
-        5. Features
-        6. Output format (only if nothing else)
-        
-        Args:
-            requirement: Initial requirement analysis
-            dataset_name: Original dataset name
-            description: Original description
-            
-        Returns:
-            Updated RequirementSpec with user answers
+        5. Output format (only if nothing else)
+
+        A choice question has a 'custom_choice' key only if one of its options
+        means "type your own value".
         """
         combined = f"{dataset_name} {description}".lower()
-        
-        # Collect questions (max 4, prioritized)
-        questions = []
-        
-        # Priority 1: Topic/target unclear
-        if requirement.completeness < 0.3 or not requirement.domain:
+        questions: List[Dict[str, Any]] = []
+
+        # Priority 1: topic, only if we could not work out any domain
+        if not requirement.domain:
             questions.append({
                 'field': 'topic',
                 'prompt': 'What topic or phenomenon do you want data about?',
                 'default': 'environmental data',
                 'type': 'text'
             })
-        
-        # Priority 2: Location
+
+        # Priority 2: location
         if not requirement.geography:
             questions.append({
                 'field': 'geography',
@@ -829,8 +902,8 @@ Return JSON only:"""
                 'default': 'global',
                 'type': 'text'
             })
-        
-        # Priority 3a: Time range (if not stated)
+
+        # Priority 3a: time range
         if not requirement.time_range and requirement.freshness_need == "unspecified":
             questions.append({
                 'field': 'time_range',
@@ -842,27 +915,28 @@ Return JSON only:"""
                     ('3', 'Last year'),
                     ('4', 'Custom range')
                 ],
+                'custom_choice': '4',
                 'type': 'choice'
             })
-        
-        # Priority 3b: Time granularity (if range is multi-year and no granularity given)
-        if requirement.time_range and 'to' in requirement.time_range:
-            years = [int(s) for s in requirement.time_range.split() if s.isdigit() and len(s) == 4]
-            if len(years) >= 2 and (years[-1] - years[0]) > 1:
-                questions.append({
-                    'field': 'time_granularity',
-                    'prompt': f'Time granularity for {requirement.time_range}?',
-                    'default': 'daily',
-                    'choices': [
-                        ('1', 'Hourly'),
-                        ('2', 'Daily'),
-                        ('3', 'Monthly'),
-                        ('4', 'Yearly')
-                    ],
-                    'type': 'choice'
-                })
-        
-        # Priority 4: Dataset size
+
+        # Priority 3b: granularity for multi-year ranges (unless already stated)
+        span = self._year_span(requirement.time_range)
+        if span and (span[1] - span[0]) > 1 and not self._extract_granularity(combined):
+            questions.append({
+                'field': 'time_granularity',
+                'prompt': f'Time granularity for {requirement.time_range}?',
+                'default': 'Daily',
+                'choices': [
+                    ('1', 'Hourly'),
+                    ('2', 'Daily'),
+                    ('3', 'Monthly'),
+                    ('4', 'Yearly')
+                ],
+                # no custom_choice: "4" here means Yearly
+                'type': 'choice'
+            })
+
+        # Priority 4: dataset size
         if not requirement.expected_size and len(questions) < 4:
             questions.append({
                 'field': 'expected_size',
@@ -874,11 +948,12 @@ Return JSON only:"""
                     ('3', '10,000 rows'),
                     ('4', 'Custom amount')
                 ],
+                'custom_choice': '4',
                 'type': 'choice'
             })
-        
-        # Priority 5: Output format (only if < 4 questions and format not specified)
-        if len(questions) < 4 and requirement.output_format == 'csv' and 'csv' not in combined:
+
+        # Priority 5: output format
+        if len(questions) < 4 and requirement.output_format == 'csv' and not re.search(r'\bcsv\b', combined):
             questions.append({
                 'field': 'output_format',
                 'prompt': 'Preferred output format?',
@@ -890,170 +965,209 @@ Return JSON only:"""
                 ],
                 'type': 'choice'
             })
-        
-        # Limit to 4 questions
+
         questions = questions[:4]
-        
-        # If no questions, return as-is
+
         if not questions:
             return requirement
-        
-        # Ask questions
-        print("\n" + "="*70)
+
+        print("\n" + "=" * 70)
         print("📋 A few quick questions to refine your requirements")
-        print("="*70)
+        print("=" * 70)
         print("(Press Enter to use default, or type 'skip' to accept all defaults)\n")
-        
-        answers = {}
+
+        answers: Dict[str, str] = {}
         skip_all = False
-        
+
         for i, q in enumerate(questions, 1):
             if skip_all:
                 answers[q['field']] = q['default']
                 continue
-            
-            # Display question
+
             print(f"\n{i}. {q['prompt']}")
-            
             if q['type'] == 'choice':
                 for choice_num, choice_text in q['choices']:
                     print(f"   {choice_num}) {choice_text}")
-            
             print(f"   Default: {q['default']}")
-            
-            # Get answer
-            try:
-                answer = input(f"   Your answer: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                answer = ""
-            
+
+            answer = self._read_input("   Your answer: ")
+
             if answer.lower() == 'skip':
                 skip_all = True
                 answers[q['field']] = q['default']
                 print("   → Skipping remaining questions, using defaults")
                 continue
-            
+
             if not answer:
                 answers[q['field']] = q['default']
                 print(f"   → Using default: {q['default']}")
-            elif q['type'] == 'choice':
-                # Handle choice
-                choice_map = {num: text for num, text in q['choices']}
-                if answer in choice_map:
-                    if answer == '4':  # Custom option
-                        try:
-                            custom = input(f"   Enter {q['field']}: ").strip()
-                            answers[q['field']] = custom if custom else q['default']
-                        except (EOFError, KeyboardInterrupt):
-                            answers[q['field']] = q['default']
-                    else:
-                        answers[q['field']] = choice_map[answer]
-                else:
-                    print(f"   → Invalid choice, using default: {q['default']}")
-                    answers[q['field']] = q['default']
-            else:
-                answers[q['field']] = answer
-        
-        # Update requirement with answers
+                continue
+
+            answers[q['field']] = self._resolve_answer(q, answer)
+
         requirement = self._apply_clarification_answers(requirement, answers)
         requirement.clarification_round = 1
-        
-        # Show confirmation
-        print("\n" + "="*70)
+
+        print("\n" + "=" * 70)
         print("✅ Requirements confirmed")
-        print("="*70)
+        print("=" * 70)
         self._print_confirmation_summary(requirement)
-        
+
         return requirement
-    
+
+    def _resolve_answer(self, q: Dict[str, Any], answer: str) -> str:
+        """Turn what the user typed into a value for question q."""
+        default = q['default']
+
+        if q['type'] != 'choice':
+            return answer
+
+        choice_map = dict(q['choices'])
+        custom_key = q.get('custom_choice')
+
+        if custom_key and answer == custom_key:
+            typed = self._read_input(f"   Enter {q['field']}: ")
+            return self._normalise_free_text(q['field'], typed, default)
+
+        if answer in choice_map:
+            return choice_map[answer]
+
+        # not an option number: treat it as the user typing their own value
+        return self._normalise_free_text(q['field'], answer, default)
+
+    def _normalise_free_text(self, field: str, text: str, default: str) -> str:
+        """Make a typed answer usable for `field`, or fall back to the default."""
+        text = (text or "").strip()
+        if not text:
+            return default
+
+        if field == 'expected_size':
+            count = self._parse_size_text(text)
+            if count:
+                return f"{count} rows"
+            print(f"   → Could not read a number from '{text}', using default: {default}")
+            return default
+
+        if field == 'output_format':
+            lowered = text.lower()
+            if lowered in ('csv', 'excel', 'json'):
+                return lowered
+            if lowered in ('xlsx', 'xls'):
+                return 'excel'
+            print(f"   → Unknown format '{text}', using default: {default}")
+            return default
+
+        if field == 'time_granularity':
+            found = self._extract_granularity(text.lower())
+            if found:
+                return found
+            print(f"   → Unknown granularity '{text}', using default: {default}")
+            return default
+
+        if field == 'time_range':
+            canonical = self._extract_time_range(text.lower(), [], [])
+            return canonical or text
+
+        return text
+
+    # Words that identify the question text / missing item belonging to each field
+    _QUESTION_KEYWORDS = {
+        'topic': ['topic'],
+        'geography': ['geographic', 'location'],
+        'time_range': ['how recent', 'time period', 'time range', 'time window'],
+        'time_granularity': ['granularity'],
+        'expected_size': ['how many', 'rows'],
+        'output_format': ['format'],
+    }
+    _MISSING_LABELS = {
+        'geography': ['geographic area'],
+        'time_range': ['specific time window'],
+        'time_granularity': ['time granularity'],
+        'expected_size': ['dataset size'],
+    }
+
     def _apply_clarification_answers(
-        self, 
-        requirement: RequirementSpec, 
+        self,
+        requirement: RequirementSpec,
         answers: Dict[str, str]
     ) -> RequirementSpec:
-        """Apply user answers to requirement spec."""
-        
+        """Apply user answers to the requirement spec."""
+
         for field, value in answers.items():
             if field == 'topic':
-                # Use LLM to understand the topic
                 if value and value != 'environmental data':
+                    ok, reason = self._check_support(value.lower())
+                    if not ok:
+                        requirement.is_supported = False
+                        requirement.unsupported_reason = reason
+                        requirement.completeness = 0.0
+                        requirement.explicitly_stated.append(f'clarified_topic: {value}')
+                        return requirement
                     try:
                         llm_result = self._analyze_with_llm("Topic", value, value.lower())
                         requirement.domain = llm_result.domain
-                        requirement.subdomain = llm_result.subdomain
+                        requirement.subdomain = self._clean_subdomain(llm_result.subdomain, value.lower())
                         requirement.problem_type = llm_result.problem_type
                         requirement.explicitly_stated.append(f'clarified_topic: {value}')
-                    except:
-                        pass
-            
+                    except Exception as e:
+                        logger.error(f"Could not analyse clarified topic '{value}': {e}")
+
             elif field == 'geography':
                 requirement.geography = value.title()
                 requirement.explicitly_stated.append(f'clarified_geography: {value}')
-                # Remove location from missing
-                if 'geographic area' in requirement.missing_or_unclear:
-                    requirement.missing_or_unclear.remove('geographic area')
-                requirement.clarifying_questions = [
-                    q for q in requirement.clarifying_questions 
-                    if 'location' not in q.lower() and 'geographic' not in q.lower()
-                ]
-            
+
             elif field == 'time_range':
                 requirement.time_range = value
                 requirement.explicitly_stated.append(f'clarified_time_range: {value}')
-            
+
             elif field == 'time_granularity':
-                # Store in description or as a note
-                granularity_note = f"Time granularity: {value}"
-                if granularity_note not in requirement.explicitly_stated:
-                    requirement.explicitly_stated.append(f'clarified_granularity: {value}')
-                # Remove from missing
-                if 'time granularity' in requirement.missing_or_unclear:
-                    requirement.missing_or_unclear.remove('time granularity')
-            
+                requirement.explicitly_stated.append(f'clarified_granularity: {value}')
+
             elif field == 'expected_size':
-                requirement.expected_size = value
-                requirement.explicitly_stated.append(f'clarified_size: {value}')
-                if 'dataset size' in requirement.missing_or_unclear:
-                    requirement.missing_or_unclear.remove('dataset size')
-            
+                count = self._parse_size_text(value)
+                requirement.expected_size = f"{count} rows" if count else value
+                requirement.explicitly_stated.append(f'clarified_size: {requirement.expected_size}')
+
             elif field == 'output_format':
-                format_map = {'CSV': 'csv', 'Excel': 'excel', 'JSON': 'json'}
-                requirement.output_format = format_map.get(value, value.lower())
-                requirement.explicitly_stated.append(f'clarified_format: {requirement.output_format}')
-        
-        # Deduplicate inferred_by_model defaults if user confirmed/clarified values
+                fmt = {'csv': 'csv', 'excel': 'excel', 'json': 'json'}.get(value.lower(), 'csv')
+                requirement.output_format = fmt
+                requirement.explicitly_stated.append(f'clarified_format: {fmt}')
+
+            # An answered question is no longer open
+            keywords = self._QUESTION_KEYWORDS.get(field, [])
+            requirement.clarifying_questions = [
+                q for q in requirement.clarifying_questions
+                if not any(k in q.lower() for k in keywords)
+            ]
+            for label in self._MISSING_LABELS.get(field, []):
+                if label in requirement.missing_or_unclear:
+                    requirement.missing_or_unclear.remove(label)
+
+        # Remove "(default)/inferred" entries the user has now confirmed
         if requirement.inferred_by_model:
-            clean_inferred = []
-            for item in requirement.inferred_by_model:
-                item_lower = item.lower()
-                should_remove = False
-                for field in answers:
-                    field_lower = field.lower()
-                    if field_lower == 'output_format' and 'output_format' in item_lower:
-                        should_remove = True
-                    elif field_lower == 'expected_size' and ('size' in item_lower or 'dataset_size' in item_lower):
-                        should_remove = True
-                    elif field_lower == 'geography' and ('geography' in item_lower or 'location' in item_lower):
-                        should_remove = True
-                    elif field_lower == 'time_range' and ('time_range' in item_lower or 'freshness' in item_lower or 'max_data_age' in item_lower):
-                        should_remove = True
-                    elif field_lower == 'time_granularity' and ('granularity' in item_lower or 'time' in item_lower):
-                        should_remove = True
-                    elif field_lower == 'topic' and any(k in item_lower for k in ['domain', 'subdomain', 'topic', 'problem_type']):
-                        should_remove = True
-                if not should_remove:
-                    clean_inferred.append(item)
-            requirement.inferred_by_model = clean_inferred
-        
-        # Recalculate completeness
+            markers = {
+                'output_format': ['output_format'],
+                'expected_size': ['size'],
+                'geography': ['geography', 'location'],
+                'time_range': ['time_range', 'freshness', 'max_data_age'],
+                'time_granularity': ['granularity'],
+            }
+            requirement.inferred_by_model = [
+                item for item in requirement.inferred_by_model
+                if not any(
+                    any(m in item.lower() for m in markers.get(field, []))
+                    for field in answers
+                )
+            ]
+
         requirement.completeness = self._calculate_confidence(
             requirement.explicitly_stated,
             requirement.missing_or_unclear,
             requirement.is_supported
         )
-        
+
         return requirement
-    
+
     def _print_confirmation_summary(self, requirement: RequirementSpec):
         """Print a summary of what was understood."""
         print(f"\n📊 What we understood:")
@@ -1069,12 +1183,11 @@ Return JSON only:"""
             print(f"   • Size: {requirement.expected_size}")
         if requirement.output_format:
             print(f"   • Format: {requirement.output_format}")
-        
-        # Show what's still missing (using defaults)
+
         if requirement.missing_or_unclear:
             print(f"\n📝 Using defaults for:")
             for item in requirement.missing_or_unclear:
                 print(f"   • {item}")
-        
+
         print(f"\n✨ Completeness: {requirement.completeness:.0%}")
         print()

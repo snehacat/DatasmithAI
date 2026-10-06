@@ -33,6 +33,7 @@ class PipelineStatus(str, Enum):
     PARTIAL_SUCCESS = "partial_success"
     FAILED = "failed"
     PAUSED = "paused"
+    REJECTED = "rejected"
 
 
 class AgentStatus(str, Enum):
@@ -54,7 +55,7 @@ class RequirementSpec(BaseModel):
     # User input
     dataset_name: str = Field(..., description="Name of the dataset")
     description: str = Field(..., description="User's description of what they need")
-    
+    topic_summary: Optional[str] = Field(None, description="LLM's short summary of the topic; never overwrites description")
     # Inferred by agents
     domain: Optional[str] = Field(None, description="Domain (e.g., healthcare, finance)")
     subdomain: Optional[str] = Field(None, description="More specific area")
@@ -234,6 +235,8 @@ class AgentExecution(BaseModel):
     
     # LLM usage
     llm_calls: int = Field(0, description="Number of LLM calls made")
+    llm_seconds: float = Field(0.0, description="Total time spent inside LLM calls")
+    user_wait_seconds: float = Field(0.0, description="Time spent waiting for user input")
     http_requests: int = Field(0, description="Number of HTTP requests made")
 
 

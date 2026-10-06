@@ -321,7 +321,7 @@ def test_no_pause_for_unsupported(temp_run_manager):
         orchestrator.register_agent(agent_def)
         
         spec = orchestrator.run("Test", "unsupported request")
-        assert spec.pipeline_status == PipelineStatus.SUCCESS
+        assert spec.pipeline_status == PipelineStatus.REJECTED
         assert spec.requirement.is_supported is False
 
 

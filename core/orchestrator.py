@@ -8,7 +8,7 @@ saves after each step, supports resume from any point.
 import json
 import logging
 from pathlib import Path
-from typing import Optional, List, Callable
+from typing import Optional, List, Callable, Dict, Any
 from datetime import datetime
 
 from .dataset_spec import (
@@ -34,7 +34,8 @@ class AgentDefinition:
         run_func: Callable[[DatasetSpec], DatasetSpec],
         required_inputs: List[str],
         outputs: List[str],
-        skip_if_unsupported: bool = True
+        skip_if_unsupported: bool = True,
+        stats_func: Optional[Callable[[], Dict[str, Any]]] = None
     ):
         """
         Define an agent.
@@ -45,12 +46,17 @@ class AgentDefinition:
             required_inputs: Which spec sections must exist before this runs
             outputs: Which spec sections this agent writes
             skip_if_unsupported: Skip if requirement is unsupported
+            stats_func: Optional function returning the agent's run statistics
+                        {'llm_calls', 'llm_seconds', 'user_wait_seconds'}.
+                        If not given, the orchestrator looks for a `stats` dict on
+                        the object that owns run_func (e.g. RequirementAnalyzer.stats).
         """
         self.name = name
         self.run_func = run_func
         self.required_inputs = required_inputs
         self.outputs = outputs
         self.skip_if_unsupported = skip_if_unsupported
+        self.stats_func = stats_func
 
 
 class Orchestrator:
@@ -62,6 +68,8 @@ class Orchestrator:
     - Pass DatasetSpec between agents
     - Save spec after each agent (for resume)
     - Handle errors and skip conditions
+    - Mark rejected requests as REJECTED (later agents are SKIPPED, status is kept)
+    - Record LLM time and user-wait time separately for each agent
     - Comprehensive logging
     
     Usage:
@@ -145,6 +153,21 @@ class Orchestrator:
             try:
                 spec = self._run_agent(spec, agent_def)
                 
+                # REJECTION: request is outside the supported scope.
+                # Mark the spec REJECTED but keep looping: every later agent with
+                # skip_if_unsupported=True is recorded as SKIPPED (see _run_agent),
+                # and the final-status step below never turns REJECTED into SUCCESS.
+                if spec.requirement and not spec.requirement.is_supported:
+                    if spec.pipeline_status != PipelineStatus.REJECTED:
+                        logger.info(
+                            f"Request rejected after {agent_def.name}: "
+                            f"{spec.requirement.unsupported_reason}"
+                        )
+                    spec.pipeline_status = PipelineStatus.REJECTED
+                    if spec.current_stage in ("initialization", ""):
+                        spec.current_stage = "requirement_rejected"
+                    continue
+                
                 # PAUSE LOGIC: After RequirementAnalyzer, check if we need user clarification
                 if agent_def.name == "RequirementAnalyzer" and spec.requirement:
                     if self._should_pause_for_clarification(spec.requirement):
@@ -167,7 +190,8 @@ class Orchestrator:
                     self.run_manager.save_spec(spec)
                 raise
         
-        # Final status
+        # Final status (only an IN_PROGRESS pipeline becomes SUCCESS;
+        # REJECTED, PAUSED and FAILED are kept as they are)
         if spec.pipeline_status == PipelineStatus.IN_PROGRESS:
             spec.pipeline_status = PipelineStatus.SUCCESS
         
@@ -210,6 +234,37 @@ class Orchestrator:
         
         # Otherwise continue - defaults will be used for missing optional info
         return False
+    
+    def _collect_agent_stats(self, agent_def: AgentDefinition) -> Dict[str, Any]:
+        """
+        Get {'llm_calls', 'llm_seconds', 'user_wait_seconds'} from an agent.
+        
+        Uses agent_def.stats_func if given, otherwise the `stats` dict on the
+        object that owns run_func (e.g. RequirementAnalyzer.stats).
+        Never raises: missing stats just means zeros.
+        """
+        try:
+            if agent_def.stats_func is not None:
+                return dict(agent_def.stats_func() or {})
+            owner = getattr(agent_def.run_func, "__self__", None)
+            stats = getattr(owner, "stats", None)
+            if isinstance(stats, dict):
+                return dict(stats)
+        except Exception as e:
+            logger.warning(f"Could not read stats for {agent_def.name}: {e}")
+        return {}
+    
+    def _apply_agent_stats(self, execution: AgentExecution, stats: Dict[str, Any]):
+        """Copy agent stats into the AgentExecution record."""
+        if not stats:
+            return
+        execution.llm_calls = int(stats.get("llm_calls", 0) or 0)
+        # These two fields exist after the dataset_spec.py update; guard so an
+        # older dataset_spec.py does not crash the pipeline.
+        if hasattr(execution, "llm_seconds"):
+            execution.llm_seconds = float(stats.get("llm_seconds", 0.0) or 0.0)
+        if hasattr(execution, "user_wait_seconds"):
+            execution.user_wait_seconds = float(stats.get("user_wait_seconds", 0.0) or 0.0)
     
     def _run_agent(self, spec: DatasetSpec, agent_def: AgentDefinition) -> DatasetSpec:
         """Run a single agent."""
@@ -279,10 +334,20 @@ class Orchestrator:
             exec.completed_at = end_time.isoformat()
             exec.duration_seconds = duration
             
+            # LLM calls / LLM time / time spent waiting for the user
+            stats = self._collect_agent_stats(agent_def)
+            self._apply_agent_stats(exec, stats)
+            
             # Update in spec (replace last execution)
             updated_spec.execution_history[-1] = exec
             
             logger.info(f"✅ {agent_def.name} completed in {duration:.2f}s")
+            if stats:
+                logger.info(
+                    f"   LLM: {exec.llm_calls} call(s), "
+                    f"{float(stats.get('llm_seconds', 0.0) or 0.0):.2f}s | "
+                    f"user wait: {float(stats.get('user_wait_seconds', 0.0) or 0.0):.2f}s"
+                )
             
             # Validate if enabled
             if self.validate_after_each:
@@ -308,6 +373,7 @@ class Orchestrator:
             exec.completed_at = end_time.isoformat()
             exec.duration_seconds = duration
             exec.error_message = str(e)
+            self._apply_agent_stats(exec, self._collect_agent_stats(agent_def))
             
             # Update in spec
             spec.execution_history[-1] = exec

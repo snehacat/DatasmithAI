@@ -3,7 +3,7 @@ Tests for Requirement Analyzer Agent
 
 Tests cover:
 1. Regex/rule-based extraction (no LLM needed)
-2. Support checking
+2. Support checking (instant, no LLM)
 3. Full analysis with LLM (requires Ollama)
 4. Full pipeline through orchestrator
 """
@@ -349,7 +349,7 @@ class TestExtractionMethods:
 
 
 class TestSupportChecking:
-    """Test support checking logic."""
+    """Test support checking logic (instant, never calls the LLM)."""
     
     def setup_method(self):
         """Setup for each test."""
@@ -437,7 +437,7 @@ class TestSupportChecking:
         assert "not supported yet" in reason.lower()
     
     def test_supported_glacier_retreat(self):
-        """Test that glacier retreat is supported (FIX 2)."""
+        """Test that glacier retreat is supported."""
         is_supported, reason = self.analyzer._check_support(
             "glacier retreat in the himalayas"
         )
@@ -446,7 +446,7 @@ class TestSupportChecking:
         assert reason is None
     
     def test_supported_landslide(self):
-        """Test that landslide events are supported (FIX 2)."""
+        """Test that landslide events are supported."""
         is_supported, reason = self.analyzer._check_support(
             "landslide events in uttarakhand"
         )
@@ -454,16 +454,17 @@ class TestSupportChecking:
         assert is_supported is True
         assert reason is None
         
-    def test_accident_risk_not_instantly_rejected(self):
-        """Test that accident risk is NOT instantly rejected, but goes to LLM scope check."""
-        from unittest.mock import patch
-        with patch.object(self.analyzer, '_check_support_with_llm', return_value=(False, "Not supported yet. Reasoning: human safety")):
-            is_supported, reason = self.analyzer._check_support(
-                "accident risk prediction dataset from year 2020 to 2025"
-            )
-            assert self.analyzer._check_support_with_llm.called
-            assert is_supported is False
-            assert "Not supported yet" in reason
+    def test_accident_risk_rejected_instantly_without_llm(self):
+        """Accident risk has no environmental keyword: rejected instantly, LLM never called."""
+        self.analyzer.llm = Mock()
+        
+        is_supported, reason = self.analyzer._check_support(
+            "accident risk prediction dataset from year 2020 to 2025"
+        )
+        
+        assert is_supported is False
+        assert "not supported yet" in reason.lower()
+        self.analyzer.llm.call.assert_not_called()
 
 
 class TestFreshnessWordBoundaries:
@@ -538,6 +539,7 @@ class TestGeographyExtraction:
             ("weather in maharashtra", "Maharashtra"),
             ("rainfall in karnataka", "Karnataka"),
             ("temperature in tamil nadu", "Tamil Nadu"),
+            ("rainfall in bihar", "Bihar"),
         ]
         
         for text, expected in test_states:
@@ -547,24 +549,31 @@ class TestGeographyExtraction:
             assert result == expected, f"Failed for {text}"
     
     def test_rishikesh_in_dataset_name(self):
-        """Test that geography is extracted from dataset name (FIX 1)."""
+        """Test that geography is extracted from the dataset name (LLM is mocked)."""
+        year = datetime.now().year
         spec = create_initial_spec(
-            'Flood Risk Prediction dataset of Rishikesh from 2020 to 2026',
+            f'Flood Risk Prediction dataset of Rishikesh from 2020 to {year}',
             'Flood risk'
         )
-        result = self.analyzer._analyze_requirement(
-            spec.requirement.dataset_name,
-            spec.requirement.description
+        mock_llm_result = LLMRequirementAnalysis(
+            domain="environmental",
+            topic_description="Flood risk"
         )
         
-        # FIX 1: Geography should be extracted from dataset name
+        with patch.object(self.analyzer, '_analyze_with_llm', return_value=mock_llm_result):
+            result = self.analyzer._analyze_requirement(
+                spec.requirement.dataset_name,
+                spec.requirement.description
+            )
+        
+        # Geography should be extracted from dataset name
         assert result.geography == "Rishikesh"
         assert "Which geographic area" not in str(result.clarifying_questions)
         
         # Time range should also be extracted from dataset name
-        assert result.time_range == "2020 to 2026"
+        assert result.time_range == f"2020 to {year}"
         
-        # FIX 3: Since time range includes 2026 (current year), should add constraint
+        # Time range reaches the current year, so "latest available" constraint is added
         assert any("latest available" in c for c in result.constraints)
 
 
@@ -836,7 +845,7 @@ class TestWithLLM:
         # Assertions
         assert req.is_supported is False
         assert req.unsupported_reason is not None
-        assert "private" in req.unsupported_reason.lower()
+        assert "not supported yet" in req.unsupported_reason.lower()
 
 
 @pytest.mark.skip(reason="Requires Ollama running with qwen2.5:3b")
@@ -919,9 +928,6 @@ class TestWithOrchestrator:
         assert spec.has_agent_succeeded("RequirementAnalyzer")
 
 
-
-
-
 class TestBoundedClarification:
     """Test bounded clarification logic."""
     
@@ -979,14 +985,15 @@ class TestBoundedClarification:
 
 
 class TestNewFixes:
-    """Test new fixes for target derivation and clarification defaults removal."""
+    """Test fixes for target derivation, clarification defaults and fallbacks."""
     
     def test_target_requires_derivation(self):
-        """Test target_requires_derivation flag and derivation note in warnings/missing_or_unclear."""
+        """Derivation note is a spec WARNING, not a 'missing information' item."""
         analyzer = RequirementAnalyzer()
+        year = datetime.now().year
         spec = create_initial_spec(
             "Flood Risk Dataset",
-            "flood risk prediction dataset in rishikesh from 2020 to 2026"
+            f"flood risk prediction dataset in rishikesh from 2020 to {year}"
         )
         
         mock_llm_result = LLMRequirementAnalysis(
@@ -1005,13 +1012,13 @@ class TestNewFixes:
             
             assert req.target_requires_derivation is True
             derivation_note = "target must be derived from real events or thresholds"
-            assert derivation_note in req.missing_or_unclear
+            assert derivation_note not in req.missing_or_unclear
             assert derivation_note in result_spec.warnings
             # Constraints must contain only user requirements (NOT derivation note)
             assert derivation_note not in req.constraints
     
     def test_clarification_removes_inferred_defaults(self):
-        """Test that user confirmation in clarification removes (default) entry from inferred_by_model."""
+        """User confirmation in clarification removes the (default) entry from inferred_by_model."""
         analyzer = RequirementAnalyzer()
         
         initial_req = RequirementSpec(
@@ -1022,9 +1029,12 @@ class TestNewFixes:
             explicitly_stated=[]
         )
         
+        updated_req = analyzer._apply_clarification_answers(initial_req, {'output_format': 'csv'})
+        
         assert not any("output_format" in item for item in updated_req.inferred_by_model)
+        assert "domain" in updated_req.inferred_by_model
         assert "clarified_format: csv" in updated_req.explicitly_stated
-
+    
     def test_fallback_air_quality_and_forest_fire_on_llm_timeout(self):
         """Test rule-based fallback when LLM times out for air quality and forest fire requests."""
         analyzer = RequirementAnalyzer()
@@ -1056,30 +1066,29 @@ class TestNewFixes:
             assert result.requirement.subdomain is None
             print("✅ General weather request keeps domain=meteorological and subdomain=None")
 
-    def test_custom_option_reads_one_line_and_defaults_if_unparsable(self):
-        """Test that typing 'custom' (option 4) reads exactly one line and falls back to default if blank."""
+    def test_custom_option_reads_one_line_and_defaults_if_blank(self):
+        """Typing the 'Custom range' option reads exactly one more line; blank falls back to the default."""
         analyzer = RequirementAnalyzer(interactive=True)
         initial_req = RequirementSpec(
             dataset_name="Test Spec",
-            description="weather data",
+            description="weather data csv",
             domain="meteorological",
-            completeness=0.2,
-            missing_or_unclear=["time range missing"],
-            clarifying_questions=[{
-                "question": "What time range do you need?",
-                "field": "time_range",
-                "type": "choice",
-                "choices": [("1", "Last 7 days"), ("2", "Last 30 days"), ("3", "Last 1 year"), ("4", "Custom")],
-                "default": "last 7 days"
-            }]
+            geography="Delhi",
+            expected_size="500 rows",
+            output_format="csv"
         )
         
-        # User enters '4' (Custom choice), then inputs an empty line '' (unparsable/blank)
+        # Only the time-range question is asked.
+        # User enters '4' (Custom range), then an empty line (blank answer).
         inputs = iter(["4", ""])
         with patch('builtins.input', side_effect=lambda prompt="": next(inputs)):
-            updated_req = analyzer.interactive_clarification(initial_req)
-            assert updated_req.time_range == "last 7 days"
-            print("✅ Custom option read exactly one follow-up line, used default for empty input, and never asked again")
+            updated_req = analyzer._bounded_clarification(
+                initial_req, "Test Spec", "weather data csv"
+            )
+        
+        assert updated_req.time_range == "latest available"
+        assert updated_req.clarification_round == 1
+        print("✅ Custom option read exactly one follow-up line, used default for blank input, never asked again")
 
 
 if __name__ == "__main__":

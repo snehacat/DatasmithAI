@@ -1,4 +1,4 @@
-"""
+﻿"""
 Unit tests for RunManager and Retention Pruning Policy
 """
 
@@ -70,8 +70,8 @@ def test_pruning_retention_policy(temp_run_manager):
     for spec_id, dt, status in test_runs:
         spec = DatasetSpec(
             spec_id=spec_id,
-            created_at=dt,
-            updated_at=dt,
+            created_at=dt.isoformat(),
+            updated_at=dt.isoformat(),
             pipeline_status=status,
             requirement=RequirementSpec(
                 dataset_name=f"Dataset {spec_id}",
@@ -149,3 +149,4 @@ def test_safety_never_delete_outside_runs_dir(temp_run_manager, tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
