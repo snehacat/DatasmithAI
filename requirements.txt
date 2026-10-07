@@ -1,0 +1,6 @@
+# DataSmith AI - Python dependencies
+# The Ollama app itself is NOT a pip package: install it from ollama.com,
+# then run:  ollama pull qwen2.5:3b
+pydantic>=2.5,<3
+ollama>=0.3
+pytest>=7.0
