@@ -80,6 +80,7 @@ REJECTED_ACCESS_WORDS = [
     'login required', 'requires login', 'requiring login', 'password protected',
 ]
 _NEGATORS = {'no', 'not', 'without', 'never', 'non', 'avoid', 'exclude', 'excluding'}
+ALLOWED_DOMAINS = {"environmental", "meteorological", "geological", "oceanographic", "hydrological"}
 
 # Locations the rule-based extractor knows (lowercase -> display name).
 # Unknown places are NOT guessed; the user is asked instead.
@@ -336,7 +337,12 @@ class RequirementAnalyzer:
             logger.error(f"LLM analysis failed: {e}. Using rule-based fallback.")
             print(f"⚠️  LLM analysis unavailable: {e}. Using rule-based fallback.")
             llm_result = self._extract_topic_with_rules(combined, description)
-
+                # The model may return no usable domain: let the rules decide
+        if not llm_result.domain:
+            rules = self._extract_topic_with_rules(combined, description)
+            llm_result.domain = rules.domain
+            if not llm_result.subdomain:
+                llm_result.subdomain = rules.subdomain
         llm_result.subdomain = self._clean_subdomain(llm_result.subdomain, combined)
         data_modality = self._map_data_modality(llm_result.data_modality)
 
@@ -676,16 +682,33 @@ class RequirementAnalyzer:
             raise ValueError(f"LLM returned {type(content).__name__}, expected a JSON object")
 
         data = dict(content)
+
+        # null in a field that has a default -> use the default
         for key in ('problem_type', 'data_modality', 'topic_description'):
             if data.get(key) is None:
-                data.pop(key, None)          # fall back to the schema default
+                data.pop(key, None)
+
+        # the model sometimes writes the string "null" instead of a real null
+        for key in ('subdomain', 'target_variable', 'time_granularity'):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip().lower() in ('', 'null', 'none'):
+                data[key] = None
+
+        # expected_features: accept null, a comma string, or a list
         features = data.get('expected_features')
         if features is None:
-            data['expected_features'] = []
+            features = []
         elif isinstance(features, str):
-            data['expected_features'] = [f.strip() for f in features.split(',') if f.strip()]
+            features = [f.strip() for f in features.split(',') if f.strip()]
         else:
-            data['expected_features'] = [str(f) for f in features if f]
+            features = [str(f) for f in features if f]
+        # drop unfilled placeholders such as "<measurement>"
+        data['expected_features'] = [f for f in features if not re.fullmatch(r'\s*<.*>\s*', f)]
+
+        # domain must be one of the allowed values, otherwise None (rules decide later)
+        domain = data.get('domain')
+        domain = domain.strip().lower() if isinstance(domain, str) else None
+        data['domain'] = domain if domain in ALLOWED_DOMAINS else None
 
         result = LLMRequirementAnalysis(**data)
 
@@ -749,7 +772,7 @@ Rules:
 Return JSON only:"""
 
         try:
-            response = self._call_llm(prompt=prompt, expected_schema=LLMRequirementAnalysis)
+            response = self._call_llm(prompt=prompt, expected_schema=None)
             return self._parse_llm_payload(response.content)
         except Exception as e:
             logger.error(f"LLM analysis failed or unusable: {e}. Using rule-based fallback.")

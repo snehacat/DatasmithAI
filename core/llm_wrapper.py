@@ -30,8 +30,8 @@ class LLMConfig(BaseModel):
     model_name: str = "qwen2.5:3b"
     temperature: float = 0.2
     top_p: float = 0.9
-    num_predict: int = 2000
-    num_ctx: int = 8192
+    num_predict: int = 800   # analyzer JSON is ~150 tokens; 800 is a safe cap
+    num_ctx: int = 4096      # prompt is ~600 tokens; a smaller context is faster on CPU
     total_timeout_seconds: int = 120  # Total time limit for all attempts (~2 minutes)
     per_attempt_timeout_seconds: int = 60  # Per-attempt timeout (default 60s for analyzer)
     max_retries: int = 1  # Maximum 1 retry (2 total attempts)
@@ -75,12 +75,15 @@ class LLMWrapper:
                 host='http://localhost:11434',
                 timeout=self.config.per_attempt_timeout_seconds
             )
-            logger.info(f"LLMWrapper initialized with model: {self.config.model_name}, timeout: {self.config.per_attempt_timeout_seconds}s")
         except Exception as e:
             logger.warning(f"Failed to create Ollama client with timeout: {e}, using default")
             self.client = None
         
-        logger.info(f"LLMWrapper initialized with model: {self.config.model_name}")
+        logger.info(
+            f"LLMWrapper initialized with model: {self.config.model_name}, "
+            f"timeout: {self.config.per_attempt_timeout_seconds}s, "
+            f"num_ctx: {self.config.num_ctx}, num_predict: {self.config.num_predict}"
+        )
     
     def call(
         self,
@@ -235,7 +238,8 @@ class LLMWrapper:
                 if expected_schema:
                     try:
                         validated = expected_schema(**content)
-                        content = validated.dict()
+                        # pydantic v2: model_dump(); v1 fallback: dict()
+                        content = validated.model_dump() if hasattr(validated, "model_dump") else validated.dict()
                         logger.debug("Schema validation passed")
                     except Exception as e:
                         validation_error = str(e)

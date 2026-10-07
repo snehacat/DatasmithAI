@@ -1089,7 +1089,38 @@ class TestNewFixes:
         assert updated_req.time_range == "latest available"
         assert updated_req.clarification_round == 1
         print("✅ Custom option read exactly one follow-up line, used default for blank input, never asked again")
+class TestLLMPayloadRobustness:
+    def _run(self, payload, description="rainfall data in Kerala"):
+        analyzer = RequirementAnalyzer()
+        spec = create_initial_spec("Rain Study", description)
+        with patch.object(analyzer.llm, 'call', return_value=Mock(content=payload)):
+            return analyzer.analyze(spec).requirement
 
+    def test_nulls_do_not_break(self):
+        req = self._run({"domain": "environmental", "problem_type": None,
+                         "data_modality": None, "expected_features": None,
+                         "topic_description": None})
+        assert req.domain == "environmental"
+        assert req.data_modality.value == "tabular"
+        assert req.expected_features == []
+
+    def test_null_domain_falls_back_to_rules(self):
+        assert self._run({"domain": None}).domain == "meteorological"
+
+    def test_invalid_domain_falls_back_to_rules(self):
+        assert self._run({"domain": "healthcare"}).domain == "meteorological"
+
+    def test_placeholder_features_are_dropped(self):
+        req = self._run({"domain": "environmental",
+                         "expected_features": ["<measurement>", "rainfall"]})
+        assert req.expected_features == ["rainfall"]
+
+    def test_wrapper_is_not_given_a_schema(self):
+        analyzer = RequirementAnalyzer()
+        with patch.object(analyzer.llm, 'call',
+                          return_value=Mock(content={"domain": "environmental"})) as m:
+            analyzer.analyze(create_initial_spec("Rain", "rainfall data in Kerala"))
+        assert m.call_args.kwargs.get('expected_schema') is None
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

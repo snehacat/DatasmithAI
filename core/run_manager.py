@@ -24,10 +24,16 @@ class RunManagerConfig:
         self,
         keep_last: int = 3,
         resumable_max_age_days: int = 7,
-        runs_dir: str = "./runs"
+        runs_dir: Optional[str] = None,
+        rejected_max_age_days: int = 1
     ):
         self.keep_last = keep_last
         self.resumable_max_age_days = resumable_max_age_days
+        self.rejected_max_age_days = rejected_max_age_days
+        # Default: <project root>/runs, so results land in the same place no matter
+        # which folder you start Python from.
+        if runs_dir is None:
+            runs_dir = str(Path(__file__).resolve().parent.parent / "runs")
         self.runs_dir = Path(runs_dir)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -39,7 +45,8 @@ class RunManager:
     Features:
     - Save specs with unique IDs
     - Maintain current.json as a copy of the latest spec
-    - Automatic pruning (keep 3 newest + resumable pending runs < 7 days old)
+    - Automatic pruning (keep 3 newest real runs + resumable pending runs < 7 days old;
+      rejected requests do not use up the "newest" slots and are removed after 1 day)
     - Strict safety checks (only delete DS_*.json inside runs_dir)
     """
     
@@ -73,19 +80,23 @@ class RunManager:
         main_path = self.runs_dir / f"{spec.spec_id}.json"
         spec_dict = spec.model_dump(mode='json')
         
-        with open(main_path, 'w', encoding='utf-8') as f:
-            json.dump(spec_dict, f, indent=2, default=str)
-        
+        self._write_json_atomic(main_path, spec_dict)
         logger.debug(f"Saved spec to: {main_path}")
         
         # Save as current.json if requested
         if is_current:
-            current_path = self.runs_dir / "current.json"
-            with open(current_path, 'w', encoding='utf-8') as f:
-                json.dump(spec_dict, f, indent=2, default=str)
+            self._write_json_atomic(self.runs_dir / "current.json", spec_dict)
             logger.debug(f"Updated current.json")
         
         return main_path
+    
+    @staticmethod
+    def _write_json_atomic(path: Path, data: Dict[str, Any]):
+        """Write to a temp file, then replace: a crash mid-write cannot corrupt the real file."""
+        tmp_path = path.with_name(path.name + ".tmp")
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp_path, path)
     
     def load_spec(self, spec_id: str) -> Optional[DatasetSpec]:
         """
@@ -158,7 +169,8 @@ class RunManager:
         
         Rules:
         - Always keep current.json
-        - Keep the top N newest runs (keep_last)
+        - Keep the top N newest real runs (keep_last); rejected runs are not counted
+          and are deleted after rejected_max_age_days
         - Keep resumable runs (pending/in_progress) newer than max_age_days
         - Delete finished (success), failed, or older runs beyond retention limits
         - Safety: Only delete DS_*.json files located strictly inside self.runs_dir
@@ -172,6 +184,7 @@ class RunManager:
         runs = self.list_runs()
         current_time = datetime.now()
         max_age = timedelta(days=self.config.resumable_max_age_days)
+        rejected_max_age = timedelta(days=self.config.rejected_max_age_days)
         
         kept = []
         to_delete = []
@@ -181,14 +194,26 @@ class RunManager:
         if current_path.exists():
             kept.append("current.json")
         
-        for i, (spec_id, timestamp, status, description) in enumerate(runs):
+        newest_kept = 0  # real (non-rejected) runs kept as "newest"
+        
+        for spec_id, timestamp, status, description in runs:
             filename = f"{spec_id}.json"
             age = current_time - timestamp
             status_lower = str(status).lower()
             
-            # Keep if in top N newest
-            if i < self.config.keep_last:
+            # Rejected requests are throw-away: they must not push real runs out of
+            # the "newest N" list. Keep them for a short time only.
+            if status_lower == 'rejected':
+                if age <= rejected_max_age:
+                    kept.append(filename)
+                else:
+                    to_delete.append(filename)
+                continue
+            
+            # Keep if in top N newest (real runs)
+            if newest_kept < self.config.keep_last:
                 kept.append(filename)
+                newest_kept += 1
                 continue
             
             # Keep if resumable (pending, in_progress, or paused) and young enough (< 7 days)
