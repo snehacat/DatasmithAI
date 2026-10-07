@@ -114,8 +114,7 @@ def main():
     print(f"   Domain: {req.domain}")
     print(f"   Subdomain: {req.subdomain if req.subdomain else 'Not specified'}")
     print(f"   Problem Type: {req.problem_type}")
-    print(f"   Data Modality: {req.data_modality}")
-    
+    print(f"   Data Modality: {req.data_modality.value if req.data_modality else 'Not specified'}")    
     print(f"\n📍 Details:")
     if req.geography:
         print(f"   Geography: {req.geography}")

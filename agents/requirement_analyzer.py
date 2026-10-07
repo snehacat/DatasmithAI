@@ -81,7 +81,8 @@ REJECTED_ACCESS_WORDS = [
 ]
 _NEGATORS = {'no', 'not', 'without', 'never', 'non', 'avoid', 'exclude', 'excluding'}
 ALLOWED_DOMAINS = {"environmental", "meteorological", "geological", "oceanographic", "hydrological"}
-
+# Phrases that imply a target the user did not name (it must be derived from real events)
+DERIVED_TARGET_PHRASES = ['flood risk', 'flood occurrence', 'fire risk', 'fire occurrence', 'landslide risk']
 # Locations the rule-based extractor knows (lowercase -> display name).
 # Unknown places are NOT guessed; the user is asked instead.
 LOCATIONS = {
@@ -279,7 +280,6 @@ class RequirementAnalyzer:
             spec.pipeline_status = PipelineStatus.REJECTED
             spec.current_stage = "requirement_rejected"
             spec.add_warning(f"Request rejected: {requirement.unsupported_reason}")
-            print(f"🚫 {requirement.unsupported_reason}")
         elif requirement.target_requires_derivation:
             derivation_note = "target must be derived from real events or thresholds"
             if derivation_note not in spec.warnings:
@@ -351,6 +351,12 @@ class RequirementAnalyzer:
             llm_result.domain = rules.domain
             if not llm_result.subdomain:
                 llm_result.subdomain = rules.subdomain
+                # Guardrail: the small model sometimes calls a vague request "prediction".
+        # Accept "prediction" only if the user's own words contain a prediction cue.
+        if llm_result.problem_type == "prediction":
+            rule_type = self._extract_topic_with_rules(combined, description).problem_type
+            if rule_type != "prediction" and not any(k in combined for k in DERIVED_TARGET_PHRASES):
+                llm_result.problem_type = rule_type
         llm_result.subdomain = self._clean_subdomain(llm_result.subdomain, combined)
         data_modality = self._map_data_modality(llm_result.data_modality)
 
@@ -362,7 +368,7 @@ class RequirementAnalyzer:
         target_terms = ['risk', 'occurrence', 'category', 'index', 'severity', 'defined', 'derived', 'prediction']
         if target_variable and any(k in target_variable.lower() for k in target_terms):
             target_requires_derivation = True
-        elif any(k in combined for k in ['flood risk', 'flood occurrence', 'fire risk', 'fire occurrence', 'landslide risk']):
+        elif any(k in combined for k in DERIVED_TARGET_PHRASES):
             target_requires_derivation = True
         # NOTE: the derivation note is a warning on the spec (added in analyze()),
         # NOT a "missing information" item.
@@ -375,8 +381,9 @@ class RequirementAnalyzer:
 
         # Prediction request whose target must be derived but the model named none:
         # keep an explicit placeholder so later agents know it still has to be defined.
-        if target_requires_derivation and not target_variable and llm_result.problem_type == "prediction":
+        if llm_result.problem_type == "prediction" and not target_variable:
             target_variable = "to be defined from real data"
+            target_requires_derivation = True
             inferred_by_model.append('target_variable: to be defined from real data (placeholder)')
 
         # Ask about granularity for multi-year ranges, unless the user already said it
@@ -537,6 +544,7 @@ class RequirementAnalyzer:
         """
         freshness = "unspecified"
         max_age = None
+        cleaned = re.sub(r'\b(?:ocean|sea|tidal|electric|water|air|rip)\s+currents?\b', ' ', text)
 
         live_patterns = [r'\blive\b', r'\breal-time\b', r'\brealtime\b', r'\breal time\b']
         if any(re.search(pattern, text) for pattern in live_patterns):
@@ -544,7 +552,7 @@ class RequirementAnalyzer:
             explicitly_stated.append('freshness: live')
             max_age = "1 hour"
             inferred.append('max_data_age: 1 hour (inferred for live data)')
-        elif any(re.search(rf'\b{word}\b', text) for word in ['recent', 'current', 'latest', 'now']):
+        elif any(re.search(rf'\b{word}\b', cleaned) for word in ['recent', 'current', 'latest', 'now']):
             freshness = "recent"
             explicitly_stated.append('freshness: recent')
             max_age = "24 hours"
@@ -585,6 +593,14 @@ class RequirementAnalyzer:
                 time_range = f"last {num} {unit}s" if int(num) > 1 else f"last {num} {unit}"
                 explicitly_stated.append(f'time_range: {time_range}')
                 return time_range
+
+        open_end = re.search(
+            r'\b(?:from\s+)?((?:19|20)\d{2})\s*(?:to|-|till|until)\s*(?:the\s+)?'
+            r'(?:present|current|now|today|date|latest)\b', text)
+        if open_end:
+            time_range = f"{open_end.group(1)} to {datetime.now().year}"
+            explicitly_stated.append(f'time_range: {time_range}')
+            return time_range
 
         year_patterns = [
             r'\bfrom\s+((?:19|20)\d{2})\s+to\s+((?:19|20)\d{2})\b',
@@ -1196,7 +1212,7 @@ Return JSON only:"""
 
         def record(field: str, label: str, value: str):
             if field in defaulted:
-                note = f'{label}: {value} (default)'
+                note = f'{field}: {value} (default)'
                 if note not in requirement.inferred_by_model:
                     requirement.inferred_by_model.append(note)
             else:
@@ -1229,6 +1245,11 @@ Return JSON only:"""
             elif field == 'time_range':
                 requirement.time_range = value
                 record(field, 'time_range', value)
+                span = self._year_span(value)
+                note = 'must cover up to latest available date'
+                if span and span[1] >= datetime.now().year and note not in requirement.constraints:
+                    requirement.constraints.append(note)
+                    requirement.explicitly_stated.append(f'constraint: {note}')
 
             elif field == 'time_granularity':
                 if field not in defaulted or not requirement.time_granularity:

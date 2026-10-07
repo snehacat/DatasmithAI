@@ -1253,5 +1253,45 @@ class TestStructuredFields:
         assert req.start_year is None
         assert req.time_window_days is None
 
+    def test_ocean_current_is_not_freshness(self):
+        a = RequirementAnalyzer()
+        assert a._extract_freshness('ocean current speed in bay of bengal', [], [], [], [])[0] == 'unspecified'
+        assert a._extract_freshness('current weather in delhi', [], [], [], [])[0] == 'recent'
+
+class TestOpenEndedRange:
+    def test_open_end_becomes_current_year(self):
+        a = RequirementAnalyzer()
+        year = datetime.now().year
+        assert a._extract_time_range('2010 to current', [], []) == f'2010 to {year}'
+        assert a._extract_time_range('from 2015 till date', [], []) == f'2015 to {year}'
+        assert a._extract_time_range('2012 to present', [], []) == f'2012 to {year}'
+
+    def test_clarified_range_sets_years_and_constraint(self):
+        a = RequirementAnalyzer()
+        year = datetime.now().year
+        req = RequirementSpec(dataset_name="T", description="d", domain="environmental")
+        req = a._apply_clarification_answers(req, {'time_range': f'2010 to {year}'}, set())
+        assert (req.start_year, req.end_year) == (2010, year)
+        assert 'must cover up to latest available date' in req.constraints
+
+
+class TestPredictionGuardrails:
+    def _run(self, desc, payload):
+        analyzer = RequirementAnalyzer()
+        with patch.object(analyzer.llm, 'call', return_value=Mock(content=payload)):
+            return analyzer._analyze_requirement("Study", desc)
+
+    def test_vague_request_is_not_called_prediction(self):
+        req = self._run("rainfall data", {"domain": "meteorological", "problem_type": "prediction"})
+        assert req.problem_type == "analysis"
+        assert req.target_variable is None
+        assert req.target_requires_derivation is False
+
+    def test_prediction_without_target_gets_placeholder(self):
+        req = self._run("dataset for flood prediction",
+                        {"domain": "hydrological", "problem_type": "prediction", "target_variable": None})
+        assert req.problem_type == "prediction"
+        assert req.target_variable == "to be defined from real data"
+        assert req.target_requires_derivation is True
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
