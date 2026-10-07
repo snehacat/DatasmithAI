@@ -123,6 +123,13 @@ LOCATIONS = {
     # Worldwide
     'worldwide': 'Worldwide', 'global': 'Global',
 }
+# Countries, continents and "worldwide": a city or state in the same request wins over these.
+_BROAD_LOCATIONS = {
+    'India', 'USA', 'United States', 'UK', 'United Kingdom', 'China', 'Japan', 'Russia',
+    'Australia', 'Canada', 'Brazil', 'Pakistan', 'Nepal', 'Bangladesh', 'Sri Lanka', 'Bhutan',
+    'Indonesia', 'Germany', 'France', 'Italy', 'Spain', 'Mexico', 'South Africa', 'Egypt',
+    'Europe', 'Asia', 'Africa', 'Antarctica', 'Arctic', 'Worldwide', 'Global',
+}
 
 
 def _keyword_regex(words: List[str], allow_plural: bool = True) -> "re.Pattern":
@@ -536,7 +543,7 @@ class RequirementAnalyzer:
         elif any(re.search(rf'\b{word}\b', text) for word in ['historical', 'past', 'archive']):
             freshness = "historical"
             explicitly_stated.append('freshness: historical')
-        elif re.search(r'from\s+\d{4}\s+to\s+\d{4}', text):
+        elif re.search(r'\bfrom\s+(?:19|20)\d{2}\s+to\s+(?:19|20)\d{2}\b', text, re.IGNORECASE):            
             freshness = "historical"
             explicitly_stated.append('freshness: historical (inferred from year range)')
 
@@ -569,9 +576,9 @@ class RequirementAnalyzer:
                 return time_range
 
         year_patterns = [
-            r'from\s+(\d{4})\s+to\s+(\d{4})',
-            r'(\d{4})\s*-\s*(\d{4})',
-            r'(\d{4})\s+to\s+(\d{4})',
+            r'\bfrom\s+((?:19|20)\d{2})\s+to\s+((?:19|20)\d{2})\b',
+            r'\b((?:19|20)\d{2})\s*-\s*((?:19|20)\d{2})\b',
+            r'\b((?:19|20)\d{2})\s+to\s+((?:19|20)\d{2})\b',
         ]
 
         for pattern in year_patterns:
@@ -604,13 +611,22 @@ class RequirementAnalyzer:
         """
         Extract geographic area by WHOLE-WORD match against LOCATIONS
         ("usa" does not match "thousand", "uk" does not match "ukraine").
+
+        If several places match: a specific place (city/state) beats a broad one
+        (country/continent); among equals the one mentioned first wins.
         Unknown places are not guessed; the user is asked instead.
         """
         text = text.lower()
-        for pattern, display in _LOCATION_PATTERNS:   # longest names first
-            if pattern.search(text):
-                explicitly_stated.append(f'geography: {display}')
-                return display
+        best = None   # (is_broad, position_in_text, display_name)
+        for pattern, display in _LOCATION_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                candidate = (display in _BROAD_LOCATIONS, match.start(), display)
+                if best is None or candidate < best:
+                    best = candidate
+        if best:
+            explicitly_stated.append(f'geography: {best[2]}')
+            return best[2]
         return None
 
     def _extract_constraints(self, text: str, explicitly_stated: List[str]) -> List[str]:

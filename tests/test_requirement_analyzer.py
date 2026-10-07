@@ -1166,5 +1166,48 @@ class TestDefaultsAreNotExplicit:
             req = analyzer._bounded_clarification(req, "Rain Study", "rainfall data")
         assert req.completeness <= before
         assert not any(s.startswith('clarified_') for s in req.explicitly_stated)
+class TestGeographySpecificity:
+    def geo(self, text):
+        return RequirementAnalyzer()._extract_geography(text, [], [])
+
+    def test_city_beats_country(self):
+        assert self.geo('air quality in delhi, india') == 'Delhi'
+
+    def test_state_beats_country_even_if_country_comes_first(self):
+        assert self.geo('india flood data for kerala') == 'Kerala'
+
+    def test_country_alone(self):
+        assert self.geo('rainfall in india') == 'India'
+
+    def test_new_delhi_is_not_delhi(self):
+        assert self.geo('smog in new delhi') == 'New Delhi'
+
+    def test_south_africa_is_not_africa(self):
+        assert self.geo('rainfall in south africa') == 'South Africa'
+
+    def test_first_specific_place_wins(self):
+        assert self.geo('rain in delhi and mumbai') == 'Delhi'
+
+    def test_whole_word_still_enforced(self):
+        assert self.geo('a thousand rows of rain') is None
+
+
+class TestYearRangeOnlyRealYears:
+    def tr(self, text):
+        return RequirementAnalyzer()._extract_time_range(text, [], [])
+
+    def test_size_range_is_not_a_time_range(self):
+        assert self.tr('1000 to 5000 rows') is None
+
+    def test_from_to_range(self):
+        assert self.tr('from 2010 to 2020') == '2010 to 2020'
+
+    def test_hyphen_range(self):
+        assert self.tr('rain 2015-2024') == '2015 to 2024'
+
+    def test_size_range_is_not_historical_freshness(self):
+        fresh, _ = RequirementAnalyzer()._extract_freshness('from 1000 to 5000 rows', [], [], [], [])
+        assert fresh == 'unspecified'
+        
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
