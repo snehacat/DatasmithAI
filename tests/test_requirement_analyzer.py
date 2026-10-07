@@ -1121,6 +1121,50 @@ class TestLLMPayloadRobustness:
                           return_value=Mock(content={"domain": "environmental"})) as m:
             analyzer.analyze(create_initial_spec("Rain", "rainfall data in Kerala"))
         assert m.call_args.kwargs.get('expected_schema') is None
+class TestDefaultsAreNotExplicit:
+    def _req(self):
+        return RequirementSpec(
+            dataset_name="T", description="d", domain="environmental",
+            missing_or_unclear=['geographic area', 'dataset size'],
+            clarifying_questions=["Which geographic area or location do you need?"],
+        )
 
+    def test_default_is_inferred_not_explicit(self):
+        analyzer = RequirementAnalyzer()
+        req = analyzer._apply_clarification_answers(self._req(), {'geography': 'global'}, {'geography'})
+        assert req.geography == 'Global'
+        assert not any('geography' in s for s in req.explicitly_stated)
+        assert 'geography: global (default)' in req.inferred_by_model
+        assert 'geographic area' in req.missing_or_unclear
+
+    def test_user_answer_is_explicit_and_closes_question(self):
+        analyzer = RequirementAnalyzer()
+        req = analyzer._apply_clarification_answers(self._req(), {'geography': 'Kerala'}, set())
+        assert 'clarified_geography: Kerala' in req.explicitly_stated
+        assert 'geographic area' not in req.missing_or_unclear
+        assert req.clarifying_questions == []
+
+    def test_unusable_typed_answer_counts_as_default(self):
+        analyzer = RequirementAnalyzer(interactive=True)
+        q = {'field': 'expected_size', 'prompt': 'x', 'default': '1000 rows',
+             'choices': [('1', '1,000 rows'), ('4', 'Custom amount')],
+             'custom_choice': '4', 'type': 'choice'}
+        analyzer._resolve_answer(q, 'lots')
+        assert analyzer._used_default is True
+        analyzer._resolve_answer(q, '1')
+        assert analyzer._used_default is False
+        analyzer._resolve_answer(q, '2000')
+        assert analyzer._used_default is False
+
+    def test_pressing_enter_everywhere_does_not_raise_completeness(self):
+        analyzer = RequirementAnalyzer(interactive=True)
+        with patch.object(analyzer.llm, 'call',
+                          return_value=Mock(content={"domain": "environmental"})):
+            req = analyzer._analyze_requirement("Rain Study", "rainfall data")
+        before = req.completeness
+        with patch('builtins.input', side_effect=iter([""] * 10)):
+            req = analyzer._bounded_clarification(req, "Rain Study", "rainfall data")
+        assert req.completeness <= before
+        assert not any(s.startswith('clarified_') for s in req.explicitly_stated)
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

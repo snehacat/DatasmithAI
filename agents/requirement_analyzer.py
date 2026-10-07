@@ -208,6 +208,7 @@ class RequirementAnalyzer:
         self.interactive = interactive
         self.stats: Dict[str, float] = {}
         self._reset_stats()
+        self._used_default = False  
 
     # ------------------------------------------------------------------
     # Timing / counters (LLM time and user-wait time are kept separate)
@@ -1000,11 +1001,14 @@ Return JSON only:"""
         print("(Press Enter to use default, or type 'skip' to accept all defaults)\n")
 
         answers: Dict[str, str] = {}
+        defaulted = set()          # fields where the user did NOT give a usable answer
         skip_all = False
 
         for i, q in enumerate(questions, 1):
+            field = q['field']
             if skip_all:
-                answers[q['field']] = q['default']
+                answers[field] = q['default']
+                defaulted.add(field)
                 continue
 
             print(f"\n{i}. {q['prompt']}")
@@ -1017,18 +1021,22 @@ Return JSON only:"""
 
             if answer.lower() == 'skip':
                 skip_all = True
-                answers[q['field']] = q['default']
+                answers[field] = q['default']
+                defaulted.add(field)
                 print("   → Skipping remaining questions, using defaults")
                 continue
 
             if not answer:
-                answers[q['field']] = q['default']
+                answers[field] = q['default']
+                defaulted.add(field)
                 print(f"   → Using default: {q['default']}")
                 continue
 
-            answers[q['field']] = self._resolve_answer(q, answer)
+            answers[field] = self._resolve_answer(q, answer)
+            if self._used_default:
+                defaulted.add(field)
 
-        requirement = self._apply_clarification_answers(requirement, answers)
+        requirement = self._apply_clarification_answers(requirement, answers, defaulted)
         requirement.clarification_round = 1
 
         print("\n" + "=" * 70)
@@ -1039,7 +1047,9 @@ Return JSON only:"""
         return requirement
 
     def _resolve_answer(self, q: Dict[str, Any], answer: str) -> str:
-        """Turn what the user typed into a value for question q."""
+        """Turn what the user typed into a value for question q.
+        Sets self._used_default = True if the typed text was unusable and the default was used."""
+        self._used_default = False
         default = q['default']
 
         if q['type'] != 'choice':
@@ -1062,6 +1072,7 @@ Return JSON only:"""
         """Make a typed answer usable for `field`, or fall back to the default."""
         text = (text or "").strip()
         if not text:
+            self._used_default = True
             return default
 
         if field == 'expected_size':
@@ -1069,6 +1080,7 @@ Return JSON only:"""
             if count:
                 return f"{count} rows"
             print(f"   → Could not read a number from '{text}', using default: {default}")
+            self._used_default = True
             return default
 
         if field == 'output_format':
@@ -1078,6 +1090,7 @@ Return JSON only:"""
             if lowered in ('xlsx', 'xls'):
                 return 'excel'
             print(f"   → Unknown format '{text}', using default: {default}")
+            self._used_default = True
             return default
 
         if field == 'time_granularity':
@@ -1085,6 +1098,7 @@ Return JSON only:"""
             if found:
                 return found
             print(f"   → Unknown granularity '{text}', using default: {default}")
+            self._used_default = True
             return default
 
         if field == 'time_range':
@@ -1112,9 +1126,25 @@ Return JSON only:"""
     def _apply_clarification_answers(
         self,
         requirement: RequirementSpec,
-        answers: Dict[str, str]
+        answers: Dict[str, str],
+        defaulted: Optional[set] = None
     ) -> RequirementSpec:
-        """Apply user answers to the requirement spec."""
+        """
+        Apply user answers to the requirement spec.
+
+        Fields in `defaulted` were NOT answered by the user. The default is used as the
+        working value, but it is recorded in inferred_by_model (marked "(default)"), not in
+        explicitly_stated, and the field stays open in missing_or_unclear / clarifying_questions.
+        """
+        defaulted = defaulted or set()
+
+        def record(field: str, label: str, value: str):
+            if field in defaulted:
+                note = f'{label}: {value} (default)'
+                if note not in requirement.inferred_by_model:
+                    requirement.inferred_by_model.append(note)
+            else:
+                requirement.explicitly_stated.append(f'clarified_{label}: {value}')
 
         for field, value in answers.items():
             if field == 'topic':
@@ -1124,39 +1154,43 @@ Return JSON only:"""
                         requirement.is_supported = False
                         requirement.unsupported_reason = reason
                         requirement.completeness = 0.0
-                        requirement.explicitly_stated.append(f'clarified_topic: {value}')
+                        record(field, 'topic', value)
                         return requirement
                     try:
                         llm_result = self._analyze_with_llm("Topic", value, value.lower())
-                        requirement.domain = llm_result.domain
+                        rules = self._extract_topic_with_rules(value.lower(), value)
+                        requirement.domain = llm_result.domain or rules.domain
                         requirement.subdomain = self._clean_subdomain(llm_result.subdomain, value.lower())
                         requirement.problem_type = llm_result.problem_type
-                        requirement.explicitly_stated.append(f'clarified_topic: {value}')
+                        record(field, 'topic', value)
                     except Exception as e:
                         logger.error(f"Could not analyse clarified topic '{value}': {e}")
 
             elif field == 'geography':
                 requirement.geography = value.title()
-                requirement.explicitly_stated.append(f'clarified_geography: {value}')
+                record(field, 'geography', value)
 
             elif field == 'time_range':
                 requirement.time_range = value
-                requirement.explicitly_stated.append(f'clarified_time_range: {value}')
+                record(field, 'time_range', value)
 
             elif field == 'time_granularity':
-                requirement.explicitly_stated.append(f'clarified_granularity: {value}')
+                record(field, 'granularity', value)
 
             elif field == 'expected_size':
                 count = self._parse_size_text(value)
                 requirement.expected_size = f"{count} rows" if count else value
-                requirement.explicitly_stated.append(f'clarified_size: {requirement.expected_size}')
+                record(field, 'size', requirement.expected_size)
 
             elif field == 'output_format':
                 fmt = {'csv': 'csv', 'excel': 'excel', 'json': 'json'}.get(value.lower(), 'csv')
                 requirement.output_format = fmt
-                requirement.explicitly_stated.append(f'clarified_format: {fmt}')
+                record(field, 'format', fmt)
 
-            # An answered question is no longer open
+            # A defaulted field stays open; an answered one is closed
+            if field in defaulted:
+                continue
+
             keywords = self._QUESTION_KEYWORDS.get(field, [])
             requirement.clarifying_questions = [
                 q for q in requirement.clarifying_questions
@@ -1166,8 +1200,9 @@ Return JSON only:"""
                 if label in requirement.missing_or_unclear:
                     requirement.missing_or_unclear.remove(label)
 
-        # Remove "(default)/inferred" entries the user has now confirmed
-        if requirement.inferred_by_model:
+        # Remove earlier model guesses ONLY for fields the user really answered
+        answered = [f for f in answers if f not in defaulted]
+        if answered and requirement.inferred_by_model:
             markers = {
                 'output_format': ['output_format'],
                 'expected_size': ['size'],
@@ -1179,7 +1214,7 @@ Return JSON only:"""
                 item for item in requirement.inferred_by_model
                 if not any(
                     any(m in item.lower() for m in markers.get(field, []))
-                    for field in answers
+                    for field in answered
                 )
             ]
 
