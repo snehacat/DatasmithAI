@@ -380,13 +380,22 @@ class RequirementAnalyzer:
             inferred_by_model.append('target_variable: to be defined from real data (placeholder)')
 
         # Ask about granularity for multi-year ranges, unless the user already said it
+                # Granularity: the user's own word wins; a model guess is only a guess
+        time_granularity = self._extract_granularity(combined)
+        if time_granularity:
+            explicitly_stated.append(f'time_granularity: {time_granularity}')
+        else:
+            guess = self._extract_granularity((llm_result.time_granularity or '').lower())
+            if guess:
+                time_granularity = guess
+                inferred_by_model.append(f'time_granularity: {guess} (model guess)')
+
         span = self._year_span(time_range)
-        if span and (span[1] - span[0]) > 1:
-            if not llm_result.time_granularity and not self._extract_granularity(combined):
-                clarifying_questions.append(
-                    "What time granularity do you need? (e.g., hourly, daily, monthly)"
-                )
-                missing_or_unclear.append('time granularity')
+        if span and (span[1] - span[0]) > 1 and not self._extract_granularity(combined):
+            clarifying_questions.append(
+                "What time granularity do you need? (e.g., hourly, daily, monthly)"
+            )
+            missing_or_unclear.append('time granularity')
 
         # Time range reaches the present -> must include the latest available data
         current_year = datetime.now().year
@@ -410,7 +419,7 @@ class RequirementAnalyzer:
         if topic_summary and topic_summary == description.strip():
             topic_summary = None  # nothing new (rule-based fallback echoes the user's text)
 
-        return RequirementSpec(
+        requirement= RequirementSpec(
             dataset_name=dataset_name,
             description=description,          # the USER's text is never overwritten
             topic_summary=topic_summary,      # the LLM's summary lives in its own field
@@ -426,6 +435,7 @@ class RequirementAnalyzer:
             max_data_age=max_data_age,
             geography=geography,
             time_range=time_range,
+            time_granularity=time_granularity,
             output_format=output_format,
             constraints=constraints,
             is_supported=is_supported,
@@ -436,6 +446,7 @@ class RequirementAnalyzer:
             clarifying_questions=clarifying_questions,
             completeness=completeness
         )
+        return self._sync_structured_fields(requirement)
 
     # ------------------------------------------------------------------
     # Rule-based extraction
@@ -867,7 +878,36 @@ Return JSON only:"""
         if not llm_modality:
             return DataModality.TABULAR
         return modality_map.get(llm_modality.lower().strip().replace(' ', '_'), DataModality.TABULAR)
+    
+    def _sync_structured_fields(self, requirement: RequirementSpec) -> RequirementSpec:
+        """Derive the machine-readable fields from the text fields. Safe to call repeatedly."""
+        # rows
+        requirement.expected_rows = None
+        if requirement.expected_size:
+            m = re.match(r'\s*(\d+)', requirement.expected_size)
+            if m and int(m.group(1)) > 0:
+                requirement.expected_rows = int(m.group(1))
 
+        # years ("2010 to 2020")
+        requirement.start_year = None
+        requirement.end_year = None
+        span = self._year_span(requirement.time_range)
+        if span:
+            requirement.start_year, requirement.end_year = span
+
+        # relative window ("last 7 days")
+        requirement.time_window_days = None
+        if requirement.time_range:
+            m = re.fullmatch(r'last (\d+) (hour|day|week|month|year)s?',
+                             requirement.time_range.strip().lower())
+            if m:
+                per_unit = {'hour': 1 / 24, 'day': 1, 'week': 7, 'month': 30, 'year': 365}
+                requirement.time_window_days = max(1, round(int(m.group(1)) * per_unit[m.group(2)]))
+
+        # freshness -> hours
+        requirement.max_data_age_hours = {'live': 1, 'recent': 24}.get(requirement.freshness_need)
+        return requirement
+    
     def _calculate_confidence(
         self, explicitly_stated: List[str], missing: List[str], is_supported: bool
     ) -> float:
@@ -1191,6 +1231,8 @@ Return JSON only:"""
                 record(field, 'time_range', value)
 
             elif field == 'time_granularity':
+                if field not in defaulted or not requirement.time_granularity:
+                    requirement.time_granularity = value
                 record(field, 'granularity', value)
 
             elif field == 'expected_size':
@@ -1233,6 +1275,7 @@ Return JSON only:"""
                     for field in answered
                 )
             ]
+        self._sync_structured_fields(requirement)
 
         requirement.completeness = self._calculate_confidence(
             requirement.explicitly_stated,

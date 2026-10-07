@@ -1208,6 +1208,50 @@ class TestYearRangeOnlyRealYears:
     def test_size_range_is_not_historical_freshness(self):
         fresh, _ = RequirementAnalyzer()._extract_freshness('from 1000 to 5000 rows', [], [], [], [])
         assert fresh == 'unspecified'
-        
+
+class TestStructuredFields:
+    def _analyze(self, name, desc, payload=None):
+        analyzer = RequirementAnalyzer()
+        payload = payload or {"domain": "environmental"}
+        with patch.object(analyzer.llm, 'call', return_value=Mock(content=payload)):
+            return analyzer._analyze_requirement(name, desc)
+
+    def test_rows_years_and_user_granularity(self):
+        req = self._analyze("Kerala Rain", "monthly rainfall in Kerala from 2010 to 2020, 5,000 rows")
+        assert req.expected_rows == 5000
+        assert (req.start_year, req.end_year) == (2010, 2020)
+        assert req.time_granularity == "Monthly"
+        assert 'time_granularity: Monthly' in req.explicitly_stated
+
+    def test_relative_window_and_live_age(self):
+        req = self._analyze("Delhi AQ", "live air quality data for Delhi, last 7 days")
+        assert req.time_window_days == 7
+        assert req.max_data_age_hours == 1
+        assert req.start_year is None
+
+    def test_model_granularity_guess_is_inferred_and_still_asked(self):
+        req = self._analyze("Rain", "rainfall in Kerala from 2010 to 2020",
+                            {"domain": "environmental", "time_granularity": "daily"})
+        assert req.time_granularity == "Daily"
+        assert any('model guess' in s for s in req.inferred_by_model)
+        assert not any(s.startswith('time_granularity') for s in req.explicitly_stated)
+        assert 'time granularity' in req.missing_or_unclear
+
+    def test_typed_size_answer_updates_rows(self):
+        analyzer = RequirementAnalyzer()
+        req = RequirementSpec(dataset_name="T", description="d", domain="environmental")
+        req = analyzer._apply_clarification_answers(req, {'expected_size': '2000'}, set())
+        assert req.expected_size == "2000 rows"
+        assert req.expected_rows == 2000
+
+    def test_unparsable_values_leave_numbers_empty(self):
+        analyzer = RequirementAnalyzer()
+        req = RequirementSpec(dataset_name="T", description="d", domain="environmental",
+                              time_range="latest available")
+        analyzer._sync_structured_fields(req)
+        assert req.expected_rows is None
+        assert req.start_year is None
+        assert req.time_window_days is None
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

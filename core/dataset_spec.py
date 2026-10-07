@@ -5,7 +5,8 @@ Universal data contract that ALL agents read and write.
 Grows through the pipeline, with each agent adding its section.
 """
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
+import uuid
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
 from enum import Enum
@@ -67,20 +68,23 @@ class RequirementSpec(BaseModel):
     target_variable: Optional[str] = Field(None, description="Target variable for prediction problems")
     target_requires_derivation: bool = Field(False, description="True if target variable must be derived from real events or thresholds")
     expected_size: Optional[str] = Field(None, description="Expected dataset size")
-    
+    expected_rows: Optional[int] = Field(None, ge=1, description="Expected number of rows as a number (derived from expected_size)")
     # Temporal requirements
     freshness_need: Literal["live", "recent", "historical", "unspecified"] = Field(
         "unspecified", 
         description="How fresh the data needs to be"
     )
     max_data_age: Optional[str] = Field(None, description="Maximum data age (e.g., '24 hours', '7 days')")
-    
+    max_data_age_hours: Optional[int] = Field(None, description="max_data_age as hours (live=1, recent=24)")
     # Geographic requirements
     geography: Optional[str] = Field(None, description="Geographic area (country, region, city)")
     
     # Time range
     time_range: Optional[str] = Field(None, description="Time range (dates or description)")
-    
+    start_year: Optional[int] = Field(None, description="First year of a range like '2010 to 2020'")
+    end_year: Optional[int] = Field(None, description="Last year of a range like '2010 to 2020'")
+    time_window_days: Optional[int] = Field(None, ge=1, description="Length in days of a relative window like 'last 7 days'")
+    time_granularity: Optional[str] = Field(None, description="Time step between records (Hourly, Daily, Monthly...)")
     # Output preferences
     output_format: Literal["csv", "excel", "json"] = Field("csv", description="Desired output format")
     
@@ -171,8 +175,7 @@ class SourceRecord(BaseModel):
     
     # Confidence & provenance
     confidence: float = Field(0.0, ge=0.0, le=1.0, description="Confidence in this source")
-    source_url: str = Field(..., description="Original URL (for provenance)")
-
+    source_url: str = Field(..., min_length=1, description="Original URL (for provenance)")
 
 class DataRecord(BaseModel):
     """A raw data record extracted from a source."""
@@ -190,7 +193,7 @@ class DataRecord(BaseModel):
     extraction_method: str = Field(..., description="How extracted (csv_parser, json_parser, etc)")
     
     # Provenance (CRITICAL)
-    source_url: str = Field(..., description="Original source URL")
+    source_url: str = Field(..., min_length=1, description="Original source URL")
     source_type: str = Field(..., description="Source type")
 
 
@@ -367,8 +370,7 @@ def create_initial_spec(dataset_name: str, description: str) -> DatasetSpec:
     Returns:
         Initial DatasetSpec with requirement section populated
     """
-    spec_id = f"DS_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
+    spec_id = f"DS_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"    
     return DatasetSpec(
         spec_id=spec_id,
         requirement=RequirementSpec(

@@ -228,6 +228,21 @@ def test_spec_update_tracking():
     assert spec.created_at == created_at  # Unchanged
     assert spec.updated_at > updated_at  # Changed
 
+def test_empty_source_url_is_rejected():
+    import pytest
+    from pydantic import ValidationError
+    from core.dataset_spec import DataRecord
+    with pytest.raises(ValidationError):
+        DataRecord(record_id="r1", source_id="s1", raw_data={},
+                   extracted_at="2026-10-07T00:00:00", extraction_method="csv_parser",
+                   source_url="", source_type="api")
+
+
+def test_spec_ids_are_unique():
+    from core.dataset_spec import create_initial_spec
+    ids = {create_initial_spec("a", "b").spec_id for _ in range(20)}
+    assert len(ids) == 20
+
 
 if __name__ == "__main__":
     # Run tests
