@@ -4,12 +4,35 @@ Simple CLI for users to input their dataset requirements
 """
 
 from agents.requirement_analyzer import RequirementAnalyzer
-from core.dataset_spec import create_initial_spec
+from core.dataset_spec import create_initial_spec, PipelineStatus
 from core.llm_wrapper import get_llm
 from core.run_manager import get_run_manager
 import json
-import time
+import logging
+import os
 import sys
+import time
+from pathlib import Path
+
+def setup_logging(log_dir=None):
+    """Write all log messages to logs/datasmith.log.
+
+    Set the environment variable DATASMITH_DEBUG=1 for more detail.
+    Returns the file handler so tests can remove it again.
+    """
+    log_dir = Path(log_dir) if log_dir else Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    handler = logging.FileHandler(log_dir / "datasmith.log", encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    )
+
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG if os.environ.get("DATASMITH_DEBUG") else logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)   # silence per-request noise
+    return handler
 
 
 def warm_up_ollama():
@@ -38,7 +61,7 @@ def warm_up_ollama():
 
 def main():
     """Main CLI interface for DataSmith AI."""
-    
+    setup_logging()
     # Check for --clean command
     if len(sys.argv) > 1 and sys.argv[1] == '--clean':
         force_clean = '--force' in sys.argv or '-f' in sys.argv
@@ -53,7 +76,6 @@ def main():
     
     # Auto-prune old runs at startup
     run_manager = get_run_manager()
-    run_manager.auto_prune()
     
     # Warm up Ollama
     warm_up_ollama()
@@ -80,7 +102,7 @@ def main():
     from core.orchestrator import Orchestrator, AgentDefinition
     
     start_time = time.time()
-    orchestrator = Orchestrator()
+    orchestrator = Orchestrator(auto_prune=True)
     analyzer = RequirementAnalyzer(interactive=True)  # Interactive mode for main.py
     
     agent_def = AgentDefinition(
@@ -94,6 +116,17 @@ def main():
     
     result = orchestrator.run(dataset_name, description)
     analysis_time = time.time() - start_time
+
+    if result.pipeline_status == PipelineStatus.PAUSED:
+        print("\n" + "="*70)
+        print("CLARIFICATION REQUIRED")
+        print("="*70)
+        if result.requirement and result.requirement.clarifying_questions:
+            for i, question in enumerate(result.requirement.clarifying_questions, 1):
+                print(f"   {i}. {question}")
+        print("\nPlease re-run with a clearer description.")
+        run_manager.save_spec(result)
+        return
     
     # Display results
     req = result.requirement
@@ -120,6 +153,8 @@ def main():
         print(f"   Geography: {req.geography}")
     if req.time_range:
         print(f"   Time Range: {req.time_range}")
+    if req.time_granularity:
+        print(f"   Time Granularity: {req.time_granularity}")
     if req.freshness_need != "unspecified":
         print(f"   Freshness: {req.freshness_need}")
     if req.max_data_age:
@@ -133,12 +168,12 @@ def main():
     
     if req.target_variable:
         print(f"   Target Variable: {req.target_variable}")
-    
     if req.constraints:
         print(f"\n⚠️  Constraints: {', '.join(req.constraints)}")
     
     print(f"\n✅ Completeness Score: {req.completeness:.2f} / 1.00")
-    print(f"   ({int(req.completeness * 100)}% of details provided)")
+    print(f"   ({round(req.completeness * 100)}% of details provided)")
+
     
     if req.explicitly_stated:
         print(f"\n✓ What you specified:")

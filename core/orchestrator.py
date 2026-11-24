@@ -18,6 +18,7 @@ from .dataset_spec import (
     PipelineStatus,
     validate_spec
 )
+from .run_manager import RunManager, RunManagerConfig
 from .run_manager import get_run_manager
 
 
@@ -82,19 +83,23 @@ class Orchestrator:
         self,
         save_dir: str = "./runs",  # Deprecated, use run_manager instead
         auto_save: bool = True,
-        validate_after_each: bool = True
+        validate_after_each: bool = True,
+        auto_prune: bool = False,
     ):
         """
         Initialize orchestrator.
         
         Args:
-            save_dir: Deprecated - use run_manager
             auto_save: Save after each agent completes
             validate_after_each: Validate spec after each agent
+            auto_prune: Prune old runs on startup (default False)
         """
-        self.run_manager = get_run_manager()
-        # Auto-prune old runs on startup
-        self.run_manager.auto_prune()
+        if save_dir and save_dir != "./runs":
+            self.run_manager = RunManager(RunManagerConfig(runs_dir=save_dir))
+        else:
+            self.run_manager = get_run_manager()
+        if auto_prune:
+            self.run_manager.auto_prune()
         
         self.auto_save = auto_save
         self.validate_after_each = validate_after_each
@@ -136,6 +141,24 @@ class Orchestrator:
             spec = self.run_manager.load_spec(resume_from)
             if spec is None:
                 raise ValueError(f"Could not load spec: {resume_from}")
+            
+            # A PAUSED run is waiting for the user's clarification. Resuming needs
+            # the clarified description, and the analyzer must run again on it.
+            if spec.pipeline_status == PipelineStatus.PAUSED:
+                if spec.requirement is None or not description.strip():
+                    raise ValueError(
+                        "This run is paused for clarification. Resume it with the "
+                        "clarified description: run(dataset_name, description, resume_from=...)"
+                    )
+                spec.requirement.description = description
+                if dataset_name.strip():
+                    spec.requirement.dataset_name = dataset_name
+                # Forget the old analyzer result so the analyzer re-runs on the new text
+                spec.execution_history = [
+                    e for e in spec.execution_history
+                    if e.agent_name != "RequirementAnalyzer"
+                ]
+                spec.add_warning("Resumed with a clarified description; requirement re-analyzed")
         else:
             logger.info(f"Creating new spec: {dataset_name}")
             from .dataset_spec import create_initial_spec
@@ -149,9 +172,20 @@ class Orchestrator:
             self.run_manager.save_spec(spec)
         
         # Run each agent
+        last_successful_agent = None
         for agent_def in self.agents:
+            already_done = spec.has_agent_succeeded(agent_def.name)
             try:
                 spec = self._run_agent(spec, agent_def)
+                if spec.has_agent_succeeded(agent_def.name):
+                    last_successful_agent = agent_def.name
+
+                # FAILURE: _run_agent returns a FAILED spec (e.g. missing required
+                # input) instead of raising. Stop here so later agents don't run
+                # on a broken spec.
+                if spec.pipeline_status == PipelineStatus.FAILED:
+                    logger.error(f"Pipeline stopped: {agent_def.name} failed")
+                    break
                 
                 # REJECTION: request is outside the supported scope.
                 # Mark the spec REJECTED but keep looping: every later agent with
@@ -169,7 +203,7 @@ class Orchestrator:
                     continue
                 
                 # PAUSE LOGIC: After RequirementAnalyzer, check if we need user clarification
-                if agent_def.name == "RequirementAnalyzer" and spec.requirement:
+                if agent_def.name == "RequirementAnalyzer" and spec.requirement and not already_done:
                     if self._should_pause_for_clarification(spec.requirement):
                         logger.warning("Pipeline paused: Requirement needs clarification")
                         spec.pipeline_status = PipelineStatus.PAUSED
@@ -185,7 +219,6 @@ class Orchestrator:
             except Exception as e:
                 logger.error(f"Fatal error in agent {agent_def.name}: {e}")
                 spec.pipeline_status = PipelineStatus.FAILED
-                spec.add_error(f"Fatal error in {agent_def.name}: {e}")
                 if self.auto_save:
                     self.run_manager.save_spec(spec)
                 raise
@@ -194,6 +227,8 @@ class Orchestrator:
         # REJECTED, PAUSED and FAILED are kept as they are)
         if spec.pipeline_status == PipelineStatus.IN_PROGRESS:
             spec.pipeline_status = PipelineStatus.SUCCESS
+            if last_successful_agent:
+                spec.current_stage = last_successful_agent
         
         # Final save
         if self.auto_save:
@@ -325,6 +360,13 @@ class Orchestrator:
             
             # Execute agent
             updated_spec = agent_def.run_func(spec)
+
+            # Every agent must hand the spec back to the pipeline
+            if not isinstance(updated_spec, DatasetSpec):
+                raise TypeError(
+                    f"Agent {agent_def.name} must return a DatasetSpec, "
+                    f"got {type(updated_spec).__name__} (did you forget 'return spec'?)"
+                )
             
             # Update execution record
             end_time = datetime.now()
@@ -425,4 +467,4 @@ class Orchestrator:
 # Convenience function
 def create_orchestrator(save_dir: str = "./runs") -> Orchestrator:
     """Create a new orchestrator instance."""
-    return Orchestrator()
+    return Orchestrator(save_dir=save_dir)

@@ -1,6 +1,6 @@
 # DataSmith AI - Intelligent Dataset Generation Platform
 
-**Status**: Phase 0 Complete ✅ - Foundations Ready
+**Status**: Phase 1 Complete ✅ - Requirement Analyzer Done
 
 ---
 
@@ -11,19 +11,23 @@ DataSmith AI is a systematic dataset generation platform built with strong found
 - **LLM Wrapper**: Reusable Ollama interface with proper error handling
 - **Orchestrator**: Pipeline runner with save/resume capability
 
-Phase 0 provides the infrastructure that all future agents will use.
+Phase 0 provides the infrastructure, and Phase 1 adds the Requirement Analyzer.
 
 ---
 
 ## Project Structure
 
 ```
-DataSmith_AI/
+DatasmithAI/
+├── agents/
+│   └── requirement_analyzer.py
 ├── core/                    # Phase 0 foundations
 │   ├── __init__.py
 │   ├── dataset_spec.py      # Data contract
 │   ├── llm_wrapper.py       # LLM wrapper
-│   └── orchestrator.py      # Pipeline orchestrator
+│   ├── orchestrator.py      # Pipeline orchestrator
+│   └── run_manager.py       # Run persistence and pruning
+├── main.py                  # CLI entry point
 ├── tests/                   # Test suite
 │   ├── __init__.py
 │   ├── test_dataset_spec.py
@@ -70,7 +74,7 @@ python -m pytest tests/ -v
 python -m pytest tests/test_dataset_spec.py -v
 ```
 
-**Expected**: 19/19 tests passing (4 skipped without Ollama)
+**Real suite count**: 257 tests passing, 13 skipped without Ollama
 
 ---
 
@@ -100,21 +104,15 @@ python -m pytest tests/test_dataset_spec.py -v
 
 ---
 
-## Next Steps: Phase 1
+## Phase 1
 
-Phase 1 will build agents using these foundations:
+### 1. Requirement Analyzer — DONE
+- Uses LLMWrapper with rule-based fallback
+- Extracts geography, time range, expected size, output format, and constraints
+- Performs scope rejection and typo suggestions
+- Writes clarification questions and provenance to the dataset spec
 
-1. **Requirement Understanding Agent**
-   - Uses LLMWrapper
-   - Writes to spec.requirement
-   - Handles user input
-
-2. **Domain Detection Agent**
-   - Reads spec.requirement
-   - Adds domain classification
-   - Uses shared data contract
-
-All future agents will follow the same pattern.
+Future agents will follow the same pattern.
 
 ---
 
@@ -131,7 +129,8 @@ All future agents will follow the same pattern.
 
 ## Dependencies
 
-- Python 3.8+
+- Python 3.9+
+- Uses tuple[...] type hints and PEP 585 generic syntax
 - Ollama (local LLM)
 - qwen2.5:3b model
 - pydantic (data validation)

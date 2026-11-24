@@ -5,7 +5,7 @@ Universal data contract that ALL agents read and write.
 Grows through the pipeline, with each agent adding its section.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 import uuid
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
@@ -15,6 +15,10 @@ from enum import Enum
 # ============================================================================
 # ENUMS
 # ============================================================================
+class SpecModel(BaseModel):
+    """Base for every spec model: values are re-validated when a field is assigned,
+    not only when the object is created."""
+    model_config = ConfigDict(validate_assignment=True)
 
 class DataModality(str, Enum):
     """Supported data modalities."""
@@ -50,7 +54,7 @@ class AgentStatus(str, Enum):
 # REQUIREMENT SECTION (Phase 1: Understanding)
 # ============================================================================
 
-class RequirementSpec(BaseModel):
+class RequirementSpec(SpecModel):
     """Requirement understanding from user input."""
     
     # User input
@@ -112,7 +116,7 @@ class RequirementSpec(BaseModel):
 # PLANNING SECTION (Phase 2: Finding data)
 # ============================================================================
 
-class SourceRequirement(BaseModel):
+class SourceRequirement(SpecModel):
     """A required source type."""
     source_type: str = Field(..., description="Type of source (e.g., meteorological_data_provider)")
     why_needed: str = Field(..., description="Why this source is relevant")
@@ -122,7 +126,7 @@ class SourceRequirement(BaseModel):
     priority: int = Field(..., ge=1, description="Priority (1=highest)")
 
 
-class SearchQuery(BaseModel):
+class SearchQuery(SpecModel):
     """A search query for finding sources."""
     query: str = Field(..., description="The actual search query")
     purpose: str = Field(..., description="What this query aims to find")
@@ -130,7 +134,7 @@ class SearchQuery(BaseModel):
     priority: int = Field(..., ge=1, description="Priority (1=highest)")
 
 
-class PlanSpec(BaseModel):
+class PlanSpec(SpecModel):
     """Planning output - what sources to find and how."""
     
     # Core strategy
@@ -150,7 +154,7 @@ class PlanSpec(BaseModel):
 # RETRIEVAL SECTION (Phase 2: Collecting data)
 # ============================================================================
 
-class SourceRecord(BaseModel):
+class SourceRecord(SpecModel):
     """A discovered data source with provenance."""
     
     # Identity
@@ -177,7 +181,7 @@ class SourceRecord(BaseModel):
     confidence: float = Field(0.0, ge=0.0, le=1.0, description="Confidence in this source")
     source_url: str = Field(..., min_length=1, description="Original URL (for provenance)")
 
-class DataRecord(BaseModel):
+class DataRecord(SpecModel):
     """A raw data record extracted from a source."""
     
     # Identity
@@ -197,7 +201,7 @@ class DataRecord(BaseModel):
     source_type: str = Field(..., description="Source type")
 
 
-class RetrievalSpec(BaseModel):
+class RetrievalSpec(SpecModel):
     """Retrieval output - discovered sources and raw data."""
     
     # Sources
@@ -221,7 +225,7 @@ class RetrievalSpec(BaseModel):
 # EXECUTION HISTORY
 # ============================================================================
 
-class AgentExecution(BaseModel):
+class AgentExecution(SpecModel):
     """Record of a single agent execution."""
     
     agent_name: str = Field(..., description="Which agent ran")
@@ -247,7 +251,7 @@ class AgentExecution(BaseModel):
 # MAIN DATASET SPECIFICATION
 # ============================================================================
 
-class DatasetSpec(BaseModel):
+class DatasetSpec(SpecModel):
     """
     Complete dataset specification.
     
@@ -324,13 +328,6 @@ def validate_spec(spec: DatasetSpec) -> tuple[bool, List[str]]:
         (is_valid, list_of_errors)
     """
     errors = []
-    
-    # Check basic structure
-    try:
-        # Pydantic validation happens automatically
-        pass
-    except Exception as e:
-        errors.append(f"Schema validation failed: {e}")
     
     # Check logical consistency
     if spec.requirement and not spec.requirement.is_supported:

@@ -3,6 +3,7 @@ Tests for Dataset Specification (Data Contract)
 """
 
 import pytest
+from pydantic import ValidationError
 from core.dataset_spec import (
     DatasetSpec,
     RequirementSpec,
@@ -242,6 +243,21 @@ def test_spec_ids_are_unique():
     from core.dataset_spec import create_initial_spec
     ids = {create_initial_spec("a", "b").spec_id for _ in range(20)}
     assert len(ids) == 20
+
+def test_invalid_assignment_is_rejected():
+    """Bad values must be rejected on assignment, not only at creation."""
+    r = RequirementSpec(dataset_name="a", description="b")
+
+    with pytest.raises(ValidationError):
+        r.output_format = "pdf"        # only csv / excel / json allowed
+    with pytest.raises(ValidationError):
+        r.completeness = 9             # must be 0 to 1
+    with pytest.raises(ValidationError):
+        r.time_window_days = 0         # must be >= 1
+
+    assert r.output_format == "csv"    # the bad value was not stored
+    r.output_format = "json"           # a valid value still works
+    assert r.output_format == "json"
 
 
 if __name__ == "__main__":

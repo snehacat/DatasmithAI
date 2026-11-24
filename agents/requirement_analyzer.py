@@ -9,7 +9,7 @@ The pilot domain is controlled by the config constants right below the imports
 (PILOT_DOMAIN_LABEL, PILOT_DOMAIN_KEYWORDS, REJECTED_* lists). To widen the
 scope later, change those constants, nothing else.
 """
-
+import difflib
 import re
 import logging
 import time
@@ -36,6 +36,7 @@ PILOT_DOMAIN_KEYWORDS = [
     # weather / climate / atmosphere
     'weather', 'climate', 'meteorological', 'meteorology', 'atmospheric', 'atmosphere',
     'temperature', 'rain', 'rainfall', 'precipitation', 'monsoon', 'wind', 'humidity',
+    'cloud', 'cloud cover', 'visibility', 'dew point', 'uv index',
     'atmospheric pressure', 'air pressure', 'barometric pressure',
     'snow', 'snowfall', 'ice', 'heatwave', 'heat wave', 'cold wave', 'lightning',
     'solar radiation', 'sunshine',
@@ -52,6 +53,7 @@ PILOT_DOMAIN_KEYWORDS = [
     'ocean', 'marine', 'sea', 'sea level', 'sea surface', 'coral', 'river', 'lake',
     'groundwater', 'water level', 'water quality', 'hydrological', 'hydrology', 'wetland',
     'mangrove',
+    'tide', 'tidal', 'tide gauge', 'sunrise', 'sunset', 'snow depth', 'sea ice', 'aerosol',
     # land / vegetation / ecology
     'forest', 'vegetation', 'ndvi', 'deforestation', 'land use', 'land cover', 'land surface',
     'soil', 'soil moisture', 'glacier', 'glacial', 'permafrost',
@@ -79,7 +81,19 @@ REJECTED_ACCESS_WORDS = [
     'private', 'paid', 'credential', 'confidential', 'paywall',
     'login required', 'requires login', 'requiring login', 'password protected',
 ]
-_NEGATORS = {'no', 'not', 'without', 'never', 'non', 'avoid', 'exclude', 'excluding'}
+_NEGATORS = {
+    'no', 'not', 'without', 'never', 'non', 'avoid', 'exclude', 'excluding',
+    "don't", 'dont', 'do not', "doesn't", 'doesnt', 'not allowed', 'not required',
+    'not needed',
+}
+_ALLOW_PHRASES = [
+    'financial year', 'fiscal year', 'fish stocks',
+    'private weather station', 'private weather stations',
+    'private sensor', 'private sensors',
+]
+_DENY_PHRASES = [
+    'ice cream', 'sea food restaurant', 'seafood', 'sea food',
+]
 ALLOWED_DOMAINS = {"environmental", "meteorological", "geological", "oceanographic", "hydrological"}
 # Phrases that imply a target the user did not name (it must be derived from real events)
 DERIVED_TARGET_PHRASES = ['flood risk', 'flood occurrence', 'fire risk', 'fire occurrence', 'landslide risk']
@@ -124,14 +138,81 @@ LOCATIONS = {
     # Worldwide
     'worldwide': 'Worldwide', 'global': 'Global',
 }
-# Countries, continents and "worldwide": a city or state in the same request wins over these.
-_BROAD_LOCATIONS = {
-    'India', 'USA', 'United States', 'UK', 'United Kingdom', 'China', 'Japan', 'Russia',
-    'Australia', 'Canada', 'Brazil', 'Pakistan', 'Nepal', 'Bangladesh', 'Sri Lanka', 'Bhutan',
-    'Indonesia', 'Germany', 'France', 'Italy', 'Spain', 'Mexico', 'South Africa', 'Egypt',
-    'Europe', 'Asia', 'Africa', 'Antarctica', 'Arctic', 'Worldwide', 'Global',
+# More places. Kept in a separate dict so it is easy to extend; merged into LOCATIONS below.
+_MORE_LOCATIONS = {
+    # India: more states / UTs / regions
+    'andaman and nicobar': 'Andaman and Nicobar', 'lakshadweep': 'Lakshadweep',
+    'puducherry': 'Puducherry', 'pondicherry': 'Puducherry', 'north india': 'North India',
+    'south india': 'South India', 'east india': 'East India', 'west india': 'West India',
+    'northeast india': 'Northeast India', 'marathwada': 'Marathwada', 'vidarbha': 'Vidarbha',
+    'konkan': 'Konkan', 'bundelkhand': 'Bundelkhand', 'sundarbans': 'Sundarbans',
+    'western ghats': 'Western Ghats', 'thar desert': 'Thar Desert', 'wayanad': 'Wayanad',
+    'kutch': 'Kutch', 'garhwal': 'Garhwal', 'kumaon': 'Kumaon', 'kedarnath': 'Kedarnath',
+    # India: more cities
+    'kochi': 'Kochi', 'cochin': 'Kochi', 'thiruvananthapuram': 'Thiruvananthapuram',
+    'kozhikode': 'Kozhikode', 'mysore': 'Mysore', 'mysuru': 'Mysuru', 'mangalore': 'Mangalore',
+    'coimbatore': 'Coimbatore', 'madurai': 'Madurai', 'visakhapatnam': 'Visakhapatnam',
+    'vijayawada': 'Vijayawada', 'surat': 'Surat', 'vadodara': 'Vadodara', 'rajkot': 'Rajkot',
+    'nagpur': 'Nagpur', 'nashik': 'Nashik', 'thane': 'Thane', 'indore': 'Indore',
+    'raipur': 'Raipur', 'ranchi': 'Ranchi', 'jamshedpur': 'Jamshedpur', 'kanpur': 'Kanpur',
+    'prayagraj': 'Prayagraj', 'allahabad': 'Prayagraj', 'noida': 'Noida', 'gurgaon': 'Gurgaon',
+    'gurugram': 'Gurugram', 'ghaziabad': 'Ghaziabad', 'faridabad': 'Faridabad',
+    'ludhiana': 'Ludhiana', 'amritsar': 'Amritsar', 'jodhpur': 'Jodhpur', 'udaipur': 'Udaipur',
+    'bhubaneswar': 'Bhubaneswar', 'cuttack': 'Cuttack', 'puri': 'Puri', 'gangtok': 'Gangtok',
+    'shillong': 'Shillong', 'imphal': 'Imphal', 'aizawl': 'Aizawl', 'itanagar': 'Itanagar',
+    'leh': 'Leh', 'jammu': 'Jammu', 'manali': 'Manali', 'darjeeling': 'Darjeeling',
+    'kullu': 'Kullu', 'chamoli': 'Chamoli', 'uttarkashi': 'Uttarkashi', 'pauri': 'Pauri',
+    'roorkee': 'Roorkee', 'haldwani': 'Haldwani', 'almora': 'Almora', 'tehri': 'Tehri',
+    # Countries
+    'afghanistan': 'Afghanistan', 'iran': 'Iran', 'iraq': 'Iraq', 'turkey': 'Turkey',
+    'saudi arabia': 'Saudi Arabia', 'israel': 'Israel', 'thailand': 'Thailand',
+    'vietnam': 'Vietnam', 'philippines': 'Philippines', 'malaysia': 'Malaysia',
+    'singapore': 'Singapore', 'myanmar': 'Myanmar', 'south korea': 'South Korea',
+    'north korea': 'North Korea', 'new zealand': 'New Zealand', 'argentina': 'Argentina',
+    'chile': 'Chile', 'peru': 'Peru', 'colombia': 'Colombia', 'nigeria': 'Nigeria',
+    'kenya': 'Kenya', 'ethiopia': 'Ethiopia', 'morocco': 'Morocco', 'greece': 'Greece',
+    'portugal': 'Portugal', 'netherlands': 'Netherlands', 'switzerland': 'Switzerland',
+    'sweden': 'Sweden', 'norway': 'Norway', 'finland': 'Finland',
+    'poland': 'Poland', 'ireland': 'Ireland', 'iceland': 'Iceland', 'greenland': 'Greenland',
+    'madagascar': 'Madagascar', 'maldives': 'Maldives',
+    # Regions / continents
+    'north america': 'North America', 'south america': 'South America', 'oceania': 'Oceania',
+    'middle east': 'Middle East', 'southeast asia': 'Southeast Asia', 'south asia': 'South Asia',
+    'east asia': 'East Asia', 'caribbean': 'Caribbean', 'amazon': 'Amazon',
+    # US states / places
+    'texas': 'Texas', 'california': 'California', 'florida': 'Florida', 'alaska': 'Alaska',
+    'hawaii': 'Hawaii', 'louisiana': 'Louisiana', 'oklahoma': 'Oklahoma', 'nevada': 'Nevada',
+    'oregon': 'Oregon', 'washington state': 'Washington State', 'arizona': 'Arizona',
+    'colorado': 'Colorado', 'los angeles': 'Los Angeles', 'san francisco': 'San Francisco',
+    'houston': 'Houston', 'chicago': 'Chicago', 'miami': 'Miami', 'seattle': 'Seattle',
+    # Cities abroad
+    'dubai': 'Dubai', 'karachi': 'Karachi', 'lahore': 'Lahore', 'dhaka': 'Dhaka',
+    'kathmandu': 'Kathmandu', 'colombo': 'Colombo', 'bangkok': 'Bangkok', 'jakarta': 'Jakarta',
+    'manila': 'Manila', 'singapore city': 'Singapore', 'shanghai': 'Shanghai', 'seoul': 'Seoul',
+    'berlin': 'Berlin', 'rome': 'Rome', 'madrid': 'Madrid', 'moscow': 'Moscow', 'cairo': 'Cairo',
+    'lagos': 'Lagos', 'nairobi': 'Nairobi', 'toronto': 'Toronto', 'mexico city': 'Mexico City',
+    # Water bodies / natural areas
+    'mediterranean sea': 'Mediterranean Sea', 'red sea': 'Red Sea', 'caspian sea': 'Caspian Sea',
+    'south china sea': 'South China Sea', 'gulf of mexico': 'Gulf of Mexico',
+    'great barrier reef': 'Great Barrier Reef', 'ganges': 'Ganges', 'brahmaputra': 'Brahmaputra',
+    'yamuna': 'Yamuna', 'godavari': 'Godavari', 'indus': 'Indus', 'mekong': 'Mekong',
+    'nile': 'Nile', 'himalaya': 'Himalayas', 'alps': 'Alps', 'andes': 'Andes',
+    'sahara': 'Sahara', 'pacific': 'Pacific Ocean', 'atlantic': 'Atlantic Ocean',
 }
-
+LOCATIONS.update({k: v for k, v in _MORE_LOCATIONS.items() if k not in LOCATIONS})
+# Countries, continents and "worldwide": a city or state in the same request wins over these.
+_BROAD_LOCATIONS ={
+    'Europe', 'Asia', 'Africa', 'Antarctica', 'Arctic', 'Worldwide', 'Global',
+    'India',
+    'Afghanistan', 'Iran', 'Iraq', 'Turkey', 'Saudi Arabia', 'Israel', 'Thailand', 'Vietnam',
+    'Philippines', 'Malaysia', 'Singapore', 'Myanmar', 'South Korea', 'North Korea',
+    'New Zealand', 'Argentina', 'Chile', 'Peru', 'Colombia', 'Nigeria', 'Kenya', 'Ethiopia',
+    'Morocco', 'Greece', 'Portugal', 'Netherlands', 'Switzerland', 'Sweden', 'Norway', 'Finland',
+    'Ukraine', 'Poland', 'Ireland', 'Iceland', 'Greenland', 'Madagascar', 'Maldives',
+    'North America', 'South America', 'Oceania', 'Middle East', 'Southeast Asia', 'South Asia',
+    'East Asia', 'Caribbean', 'North India', 'South India', 'East India', 'West India',
+    'Northeast India',
+}
 
 def _keyword_regex(words: List[str], allow_plural: bool = True) -> "re.Pattern":
     """Whole-word regex for a list of words/phrases (longest first)."""
@@ -157,11 +238,49 @@ _ENV_RE = _keyword_regex(PILOT_DOMAIN_KEYWORDS)
 _REJECT_TOPIC_RE = _keyword_regex(REJECTED_TOPIC_WORDS)
 _REJECT_ACCESS_RE = _keyword_regex(REJECTED_ACCESS_WORDS)
 _LOCATION_PATTERNS = _build_location_patterns()
-
+_MAX_PLACES = 4   # most places kept from one request
+_MAX_EXPECTED_ROWS = 10_000_000
+# ---- spelling help: "Did you mean flood?" --------------------------------------
+# Ordinary words that merely LOOK like a keyword or place (e.g. "forecast" ~ "forest",
+# "raipur" ~ "jaipur"). They are never offered as typos. If you ever see a wrong
+# "Did you mean ...?", add that word here.
+_COMMON_WORDS = set("""
+forecast forecasts forecasting predict prediction predictions predicting monitoring monitor
+analysis analyse analyze weather hazard hazards dataset datasets format formats record records
+report reports historical history latest recent current hourly daily weekly monthly yearly
+annual annually minimum maximum average mean median region regional district districts village
+station stations sensor sensors level levels change changes trend trends pattern patterns
+impact impacts damage alert alerts warning warnings intensity severity magnitude depth speed
+direction density coverage index indices images image machine learning model models training
+student project research university college about please needed need needs want wants give
+provide generate collect detailed specific general including include between during since
+until before after across within around near north south east west central northern southern
+eastern western rows row samples sample entries entry observation observations points excel
+download downloads free paid source sources open public private login access
+mangalore thane raipur pauri himalaya himalayan
+""".split())
+_KNOWN_WORDS = {
+    word
+    for phrase in (list(PILOT_DOMAIN_KEYWORDS) + list(REJECTED_TOPIC_WORDS)
+                   + list(REJECTED_ACCESS_WORDS) + list(LOCATIONS))
+    for word in phrase.split()
+} | _COMMON_WORDS
+# What a typo can be corrected TO: single-word keywords and places of 5+ letters
+_TYPO_TARGETS = sorted({
+    w for w in (list(PILOT_DOMAIN_KEYWORDS) + list(LOCATIONS))
+    if ' ' not in w and w.isalpha() and len(w) >= 3
+})
 _SIZE_UNITS = r'(?:rows?|samples?|records?|entries|entry|observations?|data\s*points?)'
 _NUMBER = r'(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)'
-_SIZE_RE = re.compile(r'(?<![\d,.])' + _NUMBER + r'\s*([km])?\s*' + _SIZE_UNITS + r'\b')
-_BARE_SIZE_RE = re.compile(r'^\s*' + _NUMBER + r'\s*([km])?\s*(?:' + _SIZE_UNITS + r')?\s*$')
+_MULTIPLIER = r'(thousands?|millions?|lakhs?|lacs?|crores?|k|m)'
+_MULTIPLIERS = {
+    'k': 1_000, 'thousand': 1_000, 'thousands': 1_000,
+    'm': 1_000_000, 'million': 1_000_000, 'millions': 1_000_000,
+    'lakh': 100_000, 'lakhs': 100_000, 'lac': 100_000, 'lacs': 100_000,
+    'crore': 10_000_000, 'crores': 10_000_000,
+}
+_SIZE_RE = re.compile(r'(?<![\d,.])' + _NUMBER + r'\s*' + _MULTIPLIER + r'?\s*' + _SIZE_UNITS + r'\b')
+_BARE_SIZE_RE = re.compile(r'^\s*' + _NUMBER + r'\s*' + _MULTIPLIER + r'?\s*(?:' + _SIZE_UNITS + r')?\s*$')
 
 _GRANULARITY_WORDS = {
     'hourly': 'Hourly', 'daily': 'Daily', 'weekly': 'Weekly', 'monthly': 'Monthly',
@@ -215,6 +334,7 @@ class RequirementAnalyzer:
         self.llm = get_llm()
         self.interactive = interactive
         self.stats: Dict[str, float] = {}
+        self._llm_fallback_used = False
         self._reset_stats()
         self._used_default = False  
 
@@ -224,6 +344,7 @@ class RequirementAnalyzer:
 
     def _reset_stats(self):
         self.stats = {'llm_calls': 0, 'llm_seconds': 0.0, 'user_wait_seconds': 0.0}
+        self._llm_fallback_used = False
 
     def _call_llm(self, **kwargs):
         """Every LLM call goes through here so it is counted and timed (also on failure)."""
@@ -243,6 +364,45 @@ class RequirementAnalyzer:
             return ""
         finally:
             self.stats['user_wait_seconds'] += time.time() - start
+
+        # ------------------------------------------------------------------
+    # Spelling help ("Did you mean flood?")
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_typos(text: str) -> List[Tuple[str, str]]:
+        """
+        Words that look like a misspelled keyword or place: [(typed, suggestion), ...]
+        At most 2. Known words and ordinary words are never flagged.
+        """
+        found: List[Tuple[str, str]] = []
+        seen = set()
+        for word in re.findall(r"[a-z]+", (text or "").lower()):
+            if len(word) < 3 or word in seen:
+                continue
+            seen.add(word)
+            base = re.sub(r'(?:es|s)$', '', word)          # "floods" -> "flood"
+            if word in _KNOWN_WORDS or base in _KNOWN_WORDS:
+                continue
+            if any(word.startswith(target) for target in _TYPO_TARGETS):   # "flooding"
+                continue
+            cutoff = 0.85 if len(word) <= 4 else 0.80
+            close = difflib.get_close_matches(word, _TYPO_TARGETS, n=1, cutoff=cutoff)
+            if close:
+                found.append((word, close[0]))
+        return found[:2]
+
+    def _confirm_typos(self, suggestions: List[Tuple[str, str]]) -> Dict[str, str]:
+        """Ask a yes/no question per suggestion. Enter means yes. Returns {typed: accepted}."""
+        accepted: Dict[str, str] = {}
+        print("\n🔎 Some words look misspelled:")
+        for typed, suggestion in suggestions:
+            answer = self._read_input(
+                f"   Did you mean '{suggestion}' instead of '{typed}'? (Y/n): "
+            ).lower()
+            if answer in ('', 'y', 'yes'):
+                accepted[typed] = suggestion
+        return accepted
 
     # ------------------------------------------------------------------
     # Entry point
@@ -268,13 +428,57 @@ class RequirementAnalyzer:
         dataset_name = spec.requirement.dataset_name
         description = spec.requirement.description
 
-        requirement = self._analyze_requirement(dataset_name, description)
+        # Misspelled keywords or places: ask "Did you mean ...?" when interactive,
+        # otherwise just note it (never change the user's words silently)
+        suggestions = self._find_typos(description)
+        accepted = self._confirm_typos(suggestions) if (suggestions and self.interactive) else {}
+        analysis_text = description
+        for typed, suggestion in accepted.items():
+            analysis_text = re.sub(
+                rf'\b{re.escape(typed)}\b', suggestion, analysis_text, flags=re.IGNORECASE
+            )
+
+        requirement = self._analyze_requirement(dataset_name, analysis_text)
+        requirement.description = description   # the user's own words are never overwritten
+
+        for note in requirement.inferred_by_model:
+            if note.startswith("dataset_size: capped"):
+                spec.add_warning("Expected rows exceeded 10,000,000; clamped to 10,000,000")
+            if note.startswith("geography: dropped places"):
+                dropped = note.split(": ", 1)[1].replace("dropped places beyond the limit: ", "")
+                question = f"Please clarify whether the dropped places should be included: {dropped}"
+                if question not in requirement.clarifying_questions:
+                    requirement.clarifying_questions.append(question)
+            if note.startswith("time_range:") and "future" in note:
+                if "historical time range" not in requirement.missing_or_unclear:
+                    requirement.missing_or_unclear.append("historical time range")
+                question = "The requested time range is entirely in the future; no historical data exists for it."
+                if question not in requirement.clarifying_questions:
+                    requirement.clarifying_questions.append(question)
+
+        if self._llm_fallback_used:
+            warning = "LLM unavailable, rule-based fallback used; expected_features may be empty"
+            spec.add_warning(warning)
+            if "llm_fallback_used" not in requirement.inferred_by_model:
+                requirement.inferred_by_model.append("llm_fallback_used")
 
         # Bounded clarification (ONE round max, if interactive)
         if self.interactive and requirement.is_supported and requirement.clarification_round == 0:
-            requirement = self._bounded_clarification(requirement, dataset_name, description)
+            requirement = self._bounded_clarification(requirement, dataset_name, analysis_text)
+
+        if suggestions:
+            for typed, suggestion in suggestions:
+                hint = f"Did you mean '{suggestion}' instead of '{typed}'?"
+                if requirement.is_supported:
+                    if not self.interactive:
+                        requirement.clarifying_questions.append(hint)
+                else:
+                    if hint not in requirement.unsupported_reason:
+                        requirement.unsupported_reason = f"{requirement.unsupported_reason} {hint}"
 
         spec.requirement = requirement
+        for typed, suggestion in accepted.items():
+            spec.add_warning(f"Typo corrected with user confirmation: '{typed}' -> '{suggestion}'")
 
         if not requirement.is_supported:
             spec.pipeline_status = PipelineStatus.REJECTED
@@ -308,6 +512,7 @@ class RequirementAnalyzer:
     def _analyze_requirement(self, dataset_name: str, description: str) -> RequirementSpec:
         """Main analysis logic. Returns a filled RequirementSpec."""
         combined = f"{dataset_name} {description}".lower()
+        self._llm_fallback_used = False
 
         explicitly_stated: List[str] = []
         inferred_by_model: List[str] = []
@@ -343,7 +548,7 @@ class RequirementAnalyzer:
             llm_result = self._analyze_with_llm(dataset_name, description, combined)
         except Exception as e:
             logger.error(f"LLM analysis failed: {e}. Using rule-based fallback.")
-            print(f"⚠️  LLM analysis unavailable: {e}. Using rule-based fallback.")
+            self._llm_fallback_used = True
             llm_result = self._extract_topic_with_rules(combined, description)
                 # The model may return no usable domain: let the rules decide
         if not llm_result.domain:
@@ -480,10 +685,7 @@ class RequirementAnalyzer:
     def _to_count(number: str, suffix: Optional[str]) -> int:
         """'1,000' -> 1000, '10' + 'k' -> 10000, '1.5' + 'k' -> 1500."""
         value = float(number.replace(',', ''))
-        if suffix == 'k':
-            value *= 1_000
-        elif suffix == 'm':
-            value *= 1_000_000
+        value *= _MULTIPLIERS.get((suffix or '').lower(), 1)
         return int(round(value))
 
     def _extract_size(
@@ -498,6 +700,9 @@ class RequirementAnalyzer:
         if match:
             count = self._to_count(match.group(1), match.group(2))
             if count > 0:
+                if count > _MAX_EXPECTED_ROWS:
+                    count = _MAX_EXPECTED_ROWS
+                    inferred.append("dataset_size: capped at 10000000 rows")
                 explicitly_stated.append(f'dataset_size: {count}')
                 return f"{count} rows"
         return None
@@ -508,7 +713,7 @@ class RequirementAnalyzer:
         match = _BARE_SIZE_RE.match(text) or _SIZE_RE.search(text)
         if match:
             count = self._to_count(match.group(1), match.group(2))
-            return count if count > 0 else None
+            return min(count, _MAX_EXPECTED_ROWS) if count > 0 else None
         return None
 
     def _extract_granularity(self, text: str) -> Optional[str]:
@@ -552,6 +757,11 @@ class RequirementAnalyzer:
             explicitly_stated.append('freshness: live')
             max_age = "1 hour"
             inferred.append('max_data_age: 1 hour (inferred for live data)')
+        elif re.search(r'\b(?:today|yesterday|tonight)\b', text):
+            freshness = "recent"
+            explicitly_stated.append('freshness: recent')
+            max_age = "24 hours"
+            inferred.append('max_data_age: 24 hours (inferred for recent data)')
         elif any(re.search(rf'\b{word}\b', cleaned) for word in ['recent', 'current', 'latest', 'now']):
             freshness = "recent"
             explicitly_stated.append('freshness: recent')
@@ -571,64 +781,138 @@ class RequirementAnalyzer:
 
         return freshness, max_age
 
+    def _year_range(self, start: int, end: int, inferred: List[str]) -> Optional[str]:
+        """Sanity-check a year range: swap reversed years, cap future years,
+        reject a range that lies entirely in the future. Returns None if unusable."""
+        now = datetime.now().year
+        if start > end:
+            start, end = end, start
+            inferred.append('time_range: years were reversed, swapped')
+        if start > now:
+            return None   # entirely in the future: no real data can exist
+        if end > now:
+            end = now
+            inferred.append(f'time_range: end year capped at {now} (no future data)')
+        return f"{start} to {end}"
+
     def _extract_time_range(
         self, text: str, explicitly_stated: List[str], inferred: List[str]
     ) -> Optional[str]:
         """
         Extract time range (history window).
 
-        Examples: "last 7 days", "from 2010 to 2020", "this month", "past 30 days".
+        Examples: "last 7 days", "10 years", "from 2010 to 2020", "between 2018 and 2022",
+        "since 2000", "in 2019", "January 2024", "winter 2023", "this month", "today".
         """
-        window_patterns = [
-            r'last\s+(\d+)\s+(hour|day|week|month|year)s?',
-            r'past\s+(\d+)\s+(hour|day|week|month|year)s?',
-            r'previous\s+(\d+)\s+(hour|day|week|month|year)s?',
-        ]
-
-        for pattern in window_patterns:
-            match = re.search(pattern, text)
-            if match:
-                num = match.group(1)
-                unit = match.group(2)
-                time_range = f"last {num} {unit}s" if int(num) > 1 else f"last {num} {unit}"
-                explicitly_stated.append(f'time_range: {time_range}')
-                return time_range
-
-        open_end = re.search(
-            r'\b(?:from\s+)?((?:19|20)\d{2})\s*(?:to|-|till|until)\s*(?:the\s+)?'
-            r'(?:present|current|now|today|date|latest)\b', text)
-        if open_end:
-            time_range = f"{open_end.group(1)} to {datetime.now().year}"
+        def found(time_range: str) -> str:
             explicitly_stated.append(f'time_range: {time_range}')
             return time_range
 
-        year_patterns = [
-            r'\bfrom\s+((?:19|20)\d{2})\s+to\s+((?:19|20)\d{2})\b',
-            r'\b((?:19|20)\d{2})\s*-\s*((?:19|20)\d{2})\b',
-            r'\b((?:19|20)\d{2})\s+to\s+((?:19|20)\d{2})\b',
-        ]
+        year = r'((?:19|20)\d{2})'
+        month_names = {
+            'jan': 'January', 'january': 'January', 'feb': 'February', 'february': 'February',
+            'mar': 'March', 'march': 'March', 'apr': 'April', 'april': 'April',
+            'may': 'May', 'jun': 'June', 'june': 'June', 'jul': 'July', 'july': 'July',
+            'aug': 'August', 'august': 'August', 'sep': 'September', 'sept': 'September',
+            'september': 'September', 'oct': 'October', 'october': 'October',
+            'nov': 'November', 'november': 'November', 'dec': 'December', 'december': 'December',
+        }
+        months = '|'.join(sorted(month_names, key=len, reverse=True))
 
-        for pattern in year_patterns:
+        # 1. relative windows: "last 7 days", "past 5 years", "previous 2 months"
+        for pattern in (r'last\s+(\d+)\s+(hour|day|week|month|year)s?',
+                        r'past\s+(\d+)\s+(hour|day|week|month|year)s?',
+                        r'previous\s+(\d+)\s+(hour|day|week|month|year)s?'):
+            match = re.search(pattern, text)
+            if match and int(match.group(1)) >= 1:
+                num, unit = int(match.group(1)), match.group(2)
+                return found(f"last {num} {unit}s" if num > 1 else f"last {num} {unit}")
+
+        if re.search(r'\b(?:last|past)\s+decade\b', text):
+            return found("last 10 years")
+
+        # 2. open-ended: "2010 to present"
+        open_end = re.search(
+            rf'\b(?:from\s+)?{year}\s*(?:to|-|till|until)\s*(?:the\s+)?'
+            r'(?:present|current|now|today|date|latest)\b', text)
+        if open_end:
+            time_range = self._year_range(int(open_end.group(1)), datetime.now().year, inferred)
+            if time_range:
+                return found(time_range)
+
+        # 3. explicit year pairs: "between 2018 and 2022", "from 2010 to 2020", "2015-2020"
+        for pattern in (
+            rf'\bbetween\s+{year}\s+and\s+{year}\b',
+            rf'\bfrom\s+{year}\s+(?:to|till|until|through)\s+{year}\b',
+            rf'\b{year}\s*-\s*{year}\b',
+            rf'\b{year}\s+(?:to|till|until|through)\s+{year}\b',
+        ):
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                time_range = f"{match.group(1)} to {match.group(2)}"
-                explicitly_stated.append(f'time_range: {time_range}')
-                return time_range
+                time_range = self._year_range(int(match.group(1)), int(match.group(2)), inferred)
+                if time_range:
+                    return found(time_range)
+                if int(match.group(1)) > datetime.now().year and int(match.group(2)) > datetime.now().year:
+                    inferred.append("time_range: future range ignored; no future data exists")
 
-        months = ('january|february|march|april|may|june|july|august|'
-                  'september|october|november|december')
-        relative_patterns = [
+        # 4. "January 2023 to March 2024"
+        match = re.search(
+            rf'\b({months})\s+{year}\s+(?:to|-|till|until|through)\s+({months})\s+{year}\b', text)
+        if match:
+            start_month = month_names[match.group(1).lower()]
+            end_month = month_names[match.group(3).lower()]
+            start_year = int(match.group(2))
+            end_year = int(match.group(4))
+            if start_year > datetime.now().year and end_year > datetime.now().year:
+                inferred.append("time_range: future range ignored; no future data exists")
+                return None
+            return found(f"{start_month} {start_year} to {end_month} {end_year}")
+
+        # 5. "since 2000", "from 2015 onwards": from that year until now
+        match = re.search(
+            rf'\b(?:since|from)\s+{year}\b(?!\s*(?:to|-|till|until|through)\s*(?:19|20)\d{{2}})', text)
+        if match:
+            time_range = self._year_range(int(match.group(1)), datetime.now().year, inferred)
+            if time_range:
+                return found(time_range)
+
+        # 6. "January 2024", "winter 2023", "monsoon 2022"
+        match = re.search(rf'\b({months})\s+{year}\b', text)
+        if match:
+            return found(f"{month_names[match.group(1).lower()]} {match.group(2)}")
+        match = re.search(
+            rf'\b(winter|summer|monsoon|spring|autumn|pre-monsoon|post-monsoon)\s+{year}\b', text)
+        if match:
+            return found(f"{match.group(1).title()} {match.group(2)}")
+
+        # 7. a bare length: "10 years", "3 months" (not "every 6 hours", "10 day forecast")
+        match = re.search(
+            r'(?<!every\s)(?<!each\s)(?<!per\s)\b(\d+)\s*-?\s*(hour|day|week|month|year)s?\b'
+            r'(?!\s+(?:forecast|ahead|old|ago))', text)
+        if match and int(match.group(1)) >= 1:
+            num, unit = int(match.group(1)), match.group(2)
+            return found(f"last {num} {unit}s" if num > 1 else f"last {num} {unit}")
+
+        # 8. a single year: "in 2019", "for 2019", "during 2023" (but not "for 2000 rows")
+        match = re.search(
+            rf'\b(?:in|for|during|of|year|throughout)\s+{year}\b'
+            rf'(?!\s*(?:{_SIZE_UNITS}\b|k\b|m\b))', text)
+        if match:
+            time_range = self._year_range(int(match.group(1)), int(match.group(1)), inferred)
+            if time_range:
+                return found(time_range)
+
+        # 9. relative words
+        for pattern, formatter in (
+            (r'\b(today|yesterday)\b', lambda m: m.group(1)),
             (r'this\s+(week|month|year)', lambda m: f"this {m.group(1)}"),
             (r'last\s+(week|month|year)', lambda m: f"last {m.group(1)}"),
-            (rf'({months})\s+to\s+({months})', lambda m: f"{m.group(1)} to {m.group(2)}"),
-        ]
-
-        for pattern, formatter in relative_patterns:
+            (rf'\b({months})\s+to\s+({months})\b',
+             lambda m: f"{month_names[m.group(1).lower()]} to {month_names[m.group(2).lower()]}"),
+        ):
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                time_range = formatter(match)
-                explicitly_stated.append(f'time_range: {time_range}')
-                return time_range
+                return found(formatter(match))
 
         return None
 
@@ -639,22 +923,40 @@ class RequirementAnalyzer:
         Extract geographic area by WHOLE-WORD match against LOCATIONS
         ("usa" does not match "thousand", "uk" does not match "ukraine").
 
-        If several places match: a specific place (city/state) beats a broad one
-        (country/continent); among equals the one mentioned first wins.
-        Unknown places are not guessed; the user is asked instead.
+        Several places are all kept (in the order written, up to 4): "Mumbai and Pune",
+        "Rishikesh, Uttarakhand". A specific place (city/state) beats a broad one
+        (country/continent), so "Delhi, India" gives "Delhi".
         """
         text = text.lower()
-        best = None   # (is_broad, position_in_text, display_name)
+        taken: List[Tuple[int, int]] = []          # spans already claimed (longest names first)
+        found: List[Tuple[int, str]] = []          # (position, display name)
         for pattern, display in _LOCATION_PATTERNS:
-            match = pattern.search(text)
-            if match:
-                candidate = (display in _BROAD_LOCATIONS, match.start(), display)
-                if best is None or candidate < best:
-                    best = candidate
-        if best:
-            explicitly_stated.append(f'geography: {best[2]}')
-            return best[2]
-        return None
+            for match in pattern.finditer(text):
+                start, end = match.span()
+                if any(start < t_end and end > t_start for t_start, t_end in taken):
+                    continue                       # "new delhi" must not also give "delhi"
+                taken.append((start, end))
+                found.append((start, display))
+        if not found:
+            return None
+
+        found.sort()
+        specific = [(pos, name) for pos, name in found if name not in _BROAD_LOCATIONS]
+        chosen = specific or found                 # a city/state beats a country/continent
+        names: List[str] = []
+        for _, name in chosen:
+            if name not in names:
+                names.append(name)
+        if len(names) > _MAX_PLACES:
+            dropped = names[_MAX_PLACES:]
+            names = names[:_MAX_PLACES]
+            inferred.append(
+                "geography: dropped places beyond the limit: " + ", ".join(dropped)
+            )
+        names = names[:_MAX_PLACES]
+        geography = ', '.join(names)
+        explicitly_stated.append(f'geography: {geography}')
+        return geography
 
     def _extract_constraints(self, text: str, explicitly_stated: List[str]) -> List[str]:
         """Extract constraints."""
@@ -684,10 +986,16 @@ class RequirementAnalyzer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _is_negated(text: str, start: int) -> bool:
-        """True if one of the 3 words before position `start` is a negator."""
+    def _is_negated(text: str, start: int, end: Optional[int] = None) -> bool:
+        """True if a negator occurs in the 3 words before or after an access word."""
         words = re.findall(r"[a-z']+", text[:start])[-3:]
-        return any(w in _NEGATORS for w in words)
+        if any(w in _NEGATORS for w in words):
+            return True
+        if end is not None:
+            after = re.findall(r"[a-z']+", text[end:])[:3]
+            if any(w in _NEGATORS for w in after):
+                return True
+        return False
 
     def _check_support(self, text: str) -> Tuple[bool, Optional[str]]:
         """
@@ -700,16 +1008,23 @@ class RequirementAnalyzer:
 
         Returns: (is_supported, unsupported_reason)
         """
-        text = text.lower()
+        original_text = text.lower()
+        env_text = original_text
+        reject_text = original_text
+        for phrase in _DENY_PHRASES:
+            env_text = re.sub(r'\b' + re.escape(phrase) + r'\b', ' ', env_text)
+            reject_text = re.sub(r'\b' + re.escape(phrase) + r'\b', ' ', reject_text)
+        for phrase in _ALLOW_PHRASES:
+            reject_text = re.sub(r'\b' + re.escape(phrase) + r'\b', ' ', reject_text)
 
-        if _REJECT_TOPIC_RE.search(text):
+        if _REJECT_TOPIC_RE.search(reject_text):
             return False, self.REJECTION_MESSAGE
 
-        for match in _REJECT_ACCESS_RE.finditer(text):
-            if not self._is_negated(text, match.start()):
+        for match in _REJECT_ACCESS_RE.finditer(reject_text):
+            if not self._is_negated(reject_text, match.start(), match.end()):
                 return False, self.REJECTION_MESSAGE
 
-        if _ENV_RE.search(text):
+        if _ENV_RE.search(env_text):
             return True, None
 
         return False, self.REJECTION_MESSAGE
@@ -768,6 +1083,13 @@ class RequirementAnalyzer:
         """
         if not subdomain:
             return None
+
+        # A subdomain is ONE phenomenon. A list of measurements ("temperature, humidity,
+        # wind_speed") or a snake_case field name is a feature list, not a subdomain.
+        # Use the keyword-based subdomain instead (None for general weather).
+        if ',' in subdomain or '_' in subdomain:
+            return self._extract_topic_with_rules(combined, "").subdomain
+
         lowered = subdomain.lower()
         has_place = any(pattern.search(lowered) for pattern, _ in _LOCATION_PATTERNS)
         has_year = re.search(r'\b\d{4}\b', lowered) is not None
@@ -795,33 +1117,23 @@ Description: {description}
 Return exactly these keys:
 {{
   "domain": "<ONE word chosen from: environmental, meteorological, geological, oceanographic, hydrological>",
-  "subdomain": "<the natural phenomenon or topic only, never a place name or a year; null if the request is general>",
+  "subdomain": "<the natural phenomenon only, never a place or year; null if general>",
   "problem_type": "<one of: monitoring, prediction, analysis>",
   "data_modality": "<one of: tabular, time_series, text>",
   "expected_features": ["<measurement>", "<measurement>"],
   "target_variable": "<what is predicted, or null>",
-  "time_granularity": "<one of: hourly, daily, monthly, yearly, or null>",
-  "topic_description": "<one sentence in your own words>"
+  "time_granularity": "<one of: hourly, daily, monthly, yearly, or null>"
 }}
 
 Rules:
-- expected_features: 3 to 6 INPUT MEASUREMENTS that real public data sources record directly.
-  Do not invent computed indices or risk scores. Do not list year, month, day or hour separately;
-  use "timestamp" for time. Use an empty list if you cannot name realistic measurements.
-- target_variable: only for prediction problems. If the target cannot be measured directly,
-  write exactly: to be defined from real data. Otherwise null.
-- time_granularity: only if the request covers several years, otherwise null.
-- subdomain: name the phenomenon or topic only. Never put a place name or a year in it.
+- expected_features: 3 to 6 measurements that public sources record directly (no computed indices); use "timestamp" for time; [] if unsure.
+- target_variable: only for prediction. If it cannot be measured directly, write exactly: to be defined from real data. Otherwise null.
+- time_granularity: only if the request covers several years, else null.
 
 Return JSON only:"""
 
-        try:
-            response = self._call_llm(prompt=prompt, expected_schema=None)
-            return self._parse_llm_payload(response.content)
-        except Exception as e:
-            logger.error(f"LLM analysis failed or unusable: {e}. Using rule-based fallback.")
-            print(f"⚠️  LLM analysis unavailable: {e}. Using rule-based fallback.")
-            return self._extract_topic_with_rules(combined, description)
+        response = self._call_llm(prompt=prompt, expected_schema=None)
+        return self._parse_llm_payload(response.content)
 
     def _extract_topic_with_rules(self, text: str, description: str) -> LLMRequirementAnalysis:
         """
@@ -953,7 +1265,7 @@ Return JSON only:"""
 
         score -= len(missing) * 0.05
 
-        return max(0.0, min(1.0, score))
+        return round(max(0.0, min(1.0, score)), 2)
 
     # ------------------------------------------------------------------
     # Clarification (ONE round, max 4 questions)
@@ -1021,7 +1333,7 @@ Return JSON only:"""
             questions.append({
                 'field': 'time_granularity',
                 'prompt': f'Time granularity for {requirement.time_range}?',
-                'default': 'Daily',
+                'default': requirement.time_granularity or 'Daily',
                 'choices': [
                     ('1', 'Hourly'),
                     ('2', 'Daily'),
@@ -1108,6 +1420,10 @@ Return JSON only:"""
             if self._used_default:
                 defaulted.add(field)
 
+        self._follow_up_granularity(
+            requirement, answers, defaulted, combined, len(questions) + 1, skip_all
+        )
+
         requirement = self._apply_clarification_answers(requirement, answers, defaulted)
         requirement.clarification_round = 1
 
@@ -1117,6 +1433,57 @@ Return JSON only:"""
         self._print_confirmation_summary(requirement)
 
         return requirement
+
+    def _follow_up_granularity(
+        self,
+        requirement: RequirementSpec,
+        answers: Dict[str, str],
+        defaulted: set,
+        combined: str,
+        number: int,
+        skip_all: bool
+    ):
+        """
+        The user just chose a multi-year time range in the questions above, so the
+        granularity question (which depends on that range) could not be asked up front.
+        Ask it now, once.
+        """
+        range_answer = answers.get('time_range')
+        if not range_answer or 'time_range' in defaulted or 'time_granularity' in answers:
+            return
+        span = self._year_span(range_answer)
+        if not span or (span[1] - span[0]) <= 1 or self._extract_granularity(combined):
+            return
+
+        q = {
+            'field': 'time_granularity',
+            'prompt': f'Time granularity for {range_answer}?',
+            'default': requirement.time_granularity or 'Daily',
+            'choices': [('1', 'Hourly'), ('2', 'Daily'), ('3', 'Monthly'), ('4', 'Yearly')],
+            'type': 'choice'
+        }
+        field = q['field']
+
+        if skip_all:
+            answers[field] = q['default']
+            defaulted.add(field)
+            return
+
+        print(f"\n{number}. {q['prompt']}")
+        for choice_num, choice_text in q['choices']:
+            print(f"   {choice_num}) {choice_text}")
+        print(f"   Default: {q['default']}")
+
+        answer = self._read_input("   Your answer: ")
+        if not answer or answer.lower() == 'skip':
+            answers[field] = q['default']
+            defaulted.add(field)
+            print(f"   → Using default: {q['default']}")
+            return
+
+        answers[field] = self._resolve_answer(q, answer)
+        if self._used_default:
+            defaulted.add(field)
 
     def _resolve_answer(self, q: Dict[str, Any], answer: str) -> str:
         """Turn what the user typed into a value for question q.
@@ -1317,6 +1684,8 @@ Return JSON only:"""
             print(f"   • Location: {requirement.geography}")
         if requirement.time_range:
             print(f"   • Time range: {requirement.time_range}")
+        if requirement.time_granularity:
+            print(f"   • Granularity: {requirement.time_granularity}")
         if requirement.expected_size:
             print(f"   • Size: {requirement.expected_size}")
         if requirement.output_format:

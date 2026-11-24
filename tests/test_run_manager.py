@@ -147,6 +147,53 @@ def test_safety_never_delete_outside_runs_dir(temp_run_manager, tmp_path):
     assert non_ds_json.exists()
 
 
+def test_load_spec_rejects_parent_traversal(temp_run_manager):
+    assert temp_run_manager.load_spec("../../x") is None
+
+
+def test_pruning_never_deletes_current(temp_run_manager):
+    (temp_run_manager.runs_dir / "current.json").write_text("{}", encoding="utf-8")
+    kept, _ = temp_run_manager.prune_runs(dry_run=False)
+    assert "current.json" in kept
+
+
+def test_old_rejected_run_is_deleted(temp_run_manager):
+    runs_dir = temp_run_manager.runs_dir
+    spec_id = "DS_old_rejected"
+    old = datetime.now() - timedelta(days=2)
+    spec = DatasetSpec(
+        spec_id=spec_id,
+        created_at=old.isoformat(),
+        updated_at=old.isoformat(),
+        pipeline_status=PipelineStatus.REJECTED,
+        requirement=RequirementSpec(dataset_name="Rejected", description="stock"),
+    )
+    (runs_dir / f"{spec_id}.json").write_text(
+        json.dumps(spec.model_dump(mode="json"), default=str), encoding="utf-8"
+    )
+    _, deleted = temp_run_manager.prune_runs(dry_run=False)
+    assert f"{spec_id}.json" in deleted
+    assert not (runs_dir / f"{spec_id}.json").exists()
+
+
+def test_young_paused_run_is_kept(temp_run_manager):
+    runs_dir = temp_run_manager.runs_dir
+    spec_id = "DS_young_paused"
+    recent = datetime.now() - timedelta(days=3)
+    spec = DatasetSpec(
+        spec_id=spec_id,
+        created_at=recent.isoformat(),
+        updated_at=recent.isoformat(),
+        pipeline_status=PipelineStatus.PAUSED,
+        requirement=RequirementSpec(dataset_name="Paused", description="vague"),
+    )
+    (runs_dir / f"{spec_id}.json").write_text(
+        json.dumps(spec.model_dump(mode="json"), default=str), encoding="utf-8"
+    )
+    kept, _ = temp_run_manager.prune_runs(dry_run=False)
+    assert f"{spec_id}.json" in kept
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

@@ -8,6 +8,7 @@ import os
 import json
 import time
 import logging
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timedelta
@@ -108,6 +109,10 @@ class RunManager:
         Returns:
             Loaded spec or None if not found
         """
+        if spec_id != "current" and not re.fullmatch(r"[A-Za-z0-9_\-]+", spec_id):
+            logger.error(f"Invalid spec_id: {spec_id}")
+            return None
+
         if spec_id == "current":
             filepath = self.runs_dir / "current.json"
         else:
@@ -271,3 +276,27 @@ def get_run_manager() -> RunManager:
     if _run_manager is None:
         _run_manager = RunManager()
     return _run_manager
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    

@@ -1185,8 +1185,8 @@ class TestGeographySpecificity:
     def test_south_africa_is_not_africa(self):
         assert self.geo('rainfall in south africa') == 'South Africa'
 
-    def test_first_specific_place_wins(self):
-        assert self.geo('rain in delhi and mumbai') == 'Delhi'
+    def test_first_specific_places_are_kept_up_to_the_limit(self):
+        assert self.geo('rain in delhi and mumbai') == 'Delhi, Mumbai'
 
     def test_whole_word_still_enforced(self):
         assert self.geo('a thousand rows of rain') is None

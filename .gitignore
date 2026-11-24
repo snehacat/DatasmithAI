@@ -28,6 +28,7 @@ runs/
 test_runs/
 *.json
 !requirements.json
+logs/
 
 # Test outputs
 .pytest_cache/
