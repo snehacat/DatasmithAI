@@ -4,6 +4,7 @@ Simple CLI for users to input their dataset requirements
 """
 
 from agents.requirement_analyzer import RequirementAnalyzer
+from agents.planning_agent import PlanningAgent
 from core.dataset_spec import create_initial_spec, PipelineStatus
 from core.llm_wrapper import get_llm
 from core.run_manager import get_run_manager
@@ -69,7 +70,7 @@ def main():
         return
     
     print("\n" + "="*70)
-    print("Welcome to DataSmith AI - Dataset Requirement Analyzer")
+    print("Welcome to DataSmith AI - Dataset Requirement Analysis and Planning")
     print("="*70)
     print("\nThis tool helps you find and prepare environmental/nature datasets.")
     print("Focus: Weather, air quality, earthquakes, fires, ocean, satellites, etc.\n")
@@ -104,6 +105,7 @@ def main():
     start_time = time.time()
     orchestrator = Orchestrator(auto_prune=True)
     analyzer = RequirementAnalyzer(interactive=True)  # Interactive mode for main.py
+    planner = PlanningAgent()
     
     agent_def = AgentDefinition(
         name="RequirementAnalyzer",
@@ -113,6 +115,13 @@ def main():
         skip_if_unsupported=False
     )
     orchestrator.register_agent(agent_def)
+    orchestrator.register_agent(AgentDefinition(
+        name="PlanningAgent",
+        run_func=planner.plan,
+        required_inputs=["requirement"],
+        outputs=["plan"],
+        skip_if_unsupported=True,
+    ))
     
     result = orchestrator.run(dataset_name, description)
     analysis_time = time.time() - start_time
@@ -127,6 +136,24 @@ def main():
         print("\nPlease re-run with a clearer description.")
         run_manager.save_spec(result)
         return
+
+    # ---- Plan summary -------------------------------------------------
+    if result.plan and result.plan.source_requirements:
+        print("\n" + "="*70)
+        print("PLAN SUMMARY")
+        print("="*70)
+        for src in result.plan.source_requirements:
+            print(f"  [{src.importance.upper():8}] {src.source_type}  (access: {', '.join(src.preferred_access_methods)})")
+        if result.plan.search_queries:
+            print(f"\n  Search queries ({len(result.plan.search_queries)}):")
+            for q in result.plan.search_queries:
+                print(f"    - {q.query}")
+        print(f"\n  Confidence: {result.plan.confidence:.2f}")
+        if result.warnings:
+            print(f"\n  Warnings:")
+            for w in result.warnings:
+                print(f"    WARNING: {w}")
+    # -------------------------------------------------------------------
     
     # Display results
     req = result.requirement

@@ -540,7 +540,8 @@ class RequirementAnalyzer:
                 unsupported_reason=unsupported_reason,
                 output_format=output_format,
                 explicitly_stated=explicitly_stated,
-                inferred_by_model=inferred_by_model
+                inferred_by_model=inferred_by_model,
+                collection_status="rejected",
             )
 
         # 3. LLM for topic understanding (rule-based fallback on ANY failure)
@@ -592,7 +593,7 @@ class RequirementAnalyzer:
             inferred_by_model.append('target_variable: to be defined from real data (placeholder)')
 
         # Ask about granularity for multi-year ranges, unless the user already said it
-                # Granularity: the user's own word wins; a model guess is only a guess
+        # Granularity: the user's own word wins; a model guess is only a guess
         time_granularity = self._extract_granularity(combined)
         if time_granularity:
             explicitly_stated.append(f'time_granularity: {time_granularity}')
@@ -621,7 +622,15 @@ class RequirementAnalyzer:
             clarifying_questions.append("Which geographic area or location do you need?")
 
         if not expected_size:
-            missing_or_unclear.append('dataset size')
+            # Consolidate into one entry: dataset size depends on
+            # the selected data sources and time range.
+            if time_range or time_granularity:
+                size_note = "dataset size (depends on the selected data sources and time range)"
+            else:
+                size_note = "dataset size"
+            if not any("dataset size" in e for e in missing_or_unclear):
+                missing_or_unclear.append(size_note)
+                clarifying_questions.append("How many rows/records do you need?")
 
         completeness = self._calculate_confidence(
             explicitly_stated, missing_or_unclear, is_supported
@@ -658,6 +667,7 @@ class RequirementAnalyzer:
             clarifying_questions=clarifying_questions,
             completeness=completeness
         )
+        self._update_collection_status(requirement)
         return self._sync_structured_fields(requirement)
 
     # ------------------------------------------------------------------
@@ -1237,7 +1247,11 @@ Return JSON only:"""
         return requirement
     
     def _calculate_confidence(
-        self, explicitly_stated: List[str], missing: List[str], is_supported: bool
+        self,
+        explicitly_stated: List[str],
+        missing: List[str],
+        is_supported: bool,
+        accepted_defaults: Optional[List[str]] = None,
     ) -> float:
         """
         Completeness score (how much detail the user provided, NOT model accuracy).
@@ -1245,6 +1259,7 @@ Return JSON only:"""
         - Base 0.50
         - 4+ explicit +0.30, 3 explicit +0.20, 2 explicit +0.10, 1 explicit +0.05, 0 explicit -0.30
         - each missing item -0.05
+        - each accepted default +0.05 (up to +0.20), reflecting lower certainty than an explicit value
         """
         if not is_supported:
             return 0.0
@@ -1264,8 +1279,20 @@ Return JSON only:"""
             score -= 0.30
 
         score -= len(missing) * 0.05
+        score += min(0.20, len(accepted_defaults or []) * 0.05)
 
         return round(max(0.0, min(1.0, score)), 2)
+
+    @staticmethod
+    def _update_collection_status(requirement: RequirementSpec) -> None:
+        if not requirement.is_supported:
+            requirement.collection_status = "rejected"
+        elif requirement.missing_or_unclear:
+            requirement.collection_status = "needs_clarification"
+        elif requirement.accepted_defaults:
+            requirement.collection_status = "collected_with_defaults"
+        else:
+            requirement.collection_status = "collected"
 
     # ------------------------------------------------------------------
     # Clarification (ONE round, max 4 questions)
@@ -1293,6 +1320,21 @@ Return JSON only:"""
         combined = f"{dataset_name} {description}".lower()
         questions: List[Dict[str, Any]] = []
 
+        provenance_markers = {
+            'geography': ('geography:', 'clarified_geography:'),
+            'time_range': ('time_range:', 'clarified_time_range:'),
+            'expected_size': (
+                'dataset_size:', 'expected_size:', 'clarified_size:',
+            ),
+        }
+
+        def has_user_confirmation(field: str) -> bool:
+            markers = provenance_markers[field]
+            return any(
+                item.strip().lower().startswith(markers)
+                for item in requirement.explicitly_stated + requirement.accepted_defaults
+            )
+
         # Priority 1: topic, only if we could not work out any domain
         if not requirement.domain:
             questions.append({
@@ -1303,20 +1345,23 @@ Return JSON only:"""
             })
 
         # Priority 2: location
-        if not requirement.geography:
+        if not requirement.geography or not has_user_confirmation('geography'):
             questions.append({
                 'field': 'geography',
                 'prompt': 'Which location or geographic area?',
-                'default': 'global',
+                'default': requirement.geography or 'global',
                 'type': 'text'
             })
 
         # Priority 3a: time range
-        if not requirement.time_range and requirement.freshness_need == "unspecified":
+        if (
+            (not requirement.time_range or not has_user_confirmation('time_range'))
+            and (requirement.time_range or requirement.freshness_need == "unspecified")
+        ):
             questions.append({
                 'field': 'time_range',
                 'prompt': 'What time period do you need?',
-                'default': 'latest available',
+                'default': requirement.time_range or 'latest available',
                 'choices': [
                     ('1', 'Last 7 days'),
                     ('2', 'Last month'),
@@ -1345,11 +1390,14 @@ Return JSON only:"""
             })
 
         # Priority 4: dataset size
-        if not requirement.expected_size and len(questions) < 4:
+        if (
+            (not requirement.expected_size or not has_user_confirmation('expected_size'))
+            and len(questions) < 4
+        ):
             questions.append({
                 'field': 'expected_size',
                 'prompt': 'How many rows/records do you need?',
-                'default': '1000 rows',
+                'default': requirement.expected_size or '1000 rows',
                 'choices': [
                     ('1', '1,000 rows'),
                     ('2', '5,000 rows'),
@@ -1385,7 +1433,9 @@ Return JSON only:"""
         print("(Press Enter to use default, or type 'skip' to accept all defaults)\n")
 
         answers: Dict[str, str] = {}
-        defaulted = set()          # fields where the user did NOT give a usable answer
+        defaulted = set()
+        accepted_defaults = set()
+        unresolved_defaults = set()
         skip_all = False
 
         for i, q in enumerate(questions, 1):
@@ -1393,6 +1443,7 @@ Return JSON only:"""
             if skip_all:
                 answers[field] = q['default']
                 defaulted.add(field)
+                accepted_defaults.add(field)
                 continue
 
             print(f"\n{i}. {q['prompt']}")
@@ -1407,28 +1458,45 @@ Return JSON only:"""
                 skip_all = True
                 answers[field] = q['default']
                 defaulted.add(field)
+                accepted_defaults.add(field)
                 print("   → Skipping remaining questions, using defaults")
                 continue
 
             if not answer:
                 answers[field] = q['default']
                 defaulted.add(field)
+                accepted_defaults.add(field)
                 print(f"   → Using default: {q['default']}")
                 continue
 
             answers[field] = self._resolve_answer(q, answer)
             if self._used_default:
                 defaulted.add(field)
+                unresolved_defaults.add(field)
 
         self._follow_up_granularity(
-            requirement, answers, defaulted, combined, len(questions) + 1, skip_all
+            requirement,
+            answers,
+            defaulted,
+            combined,
+            len(questions) + 1,
+            skip_all,
+            accepted_defaults,
+            unresolved_defaults,
         )
 
-        requirement = self._apply_clarification_answers(requirement, answers, defaulted)
+        requirement = self._apply_clarification_answers(
+            requirement, answers, defaulted, accepted_defaults, unresolved_defaults
+        )
         requirement.clarification_round = 1
 
         print("\n" + "=" * 70)
-        print("✅ Requirements confirmed")
+        if requirement.collection_status == "needs_clarification":
+            print("⚠️ Requirements collected; clarification is still needed")
+        elif requirement.collection_status == "collected_with_defaults":
+            print("✅ Requirements collected with accepted defaults")
+        else:
+            print("✅ Requirements confirmed")
         print("=" * 70)
         self._print_confirmation_summary(requirement)
 
@@ -1441,7 +1509,9 @@ Return JSON only:"""
         defaulted: set,
         combined: str,
         number: int,
-        skip_all: bool
+        skip_all: bool,
+        accepted_defaults: Optional[set] = None,
+        unresolved_defaults: Optional[set] = None,
     ):
         """
         The user just chose a multi-year time range in the questions above, so the
@@ -1451,6 +1521,8 @@ Return JSON only:"""
         range_answer = answers.get('time_range')
         if not range_answer or 'time_range' in defaulted or 'time_granularity' in answers:
             return
+        accepted_defaults = accepted_defaults if accepted_defaults is not None else set()
+        unresolved_defaults = unresolved_defaults if unresolved_defaults is not None else set()
         span = self._year_span(range_answer)
         if not span or (span[1] - span[0]) <= 1 or self._extract_granularity(combined):
             return
@@ -1467,6 +1539,7 @@ Return JSON only:"""
         if skip_all:
             answers[field] = q['default']
             defaulted.add(field)
+            accepted_defaults.add(field)
             return
 
         print(f"\n{number}. {q['prompt']}")
@@ -1478,12 +1551,14 @@ Return JSON only:"""
         if not answer or answer.lower() == 'skip':
             answers[field] = q['default']
             defaulted.add(field)
+            accepted_defaults.add(field)
             print(f"   → Using default: {q['default']}")
             return
 
         answers[field] = self._resolve_answer(q, answer)
         if self._used_default:
             defaulted.add(field)
+            unresolved_defaults.add(field)
 
     def _resolve_answer(self, q: Dict[str, Any], answer: str) -> str:
         """Turn what the user typed into a value for question q.
@@ -1556,32 +1631,49 @@ Return JSON only:"""
         'output_format': ['format'],
     }
     _MISSING_LABELS = {
+        'topic': ['topic'],
         'geography': ['geographic area'],
         'time_range': ['specific time window'],
         'time_granularity': ['time granularity'],
         'expected_size': ['dataset size'],
+        'output_format': ['output format'],
+    }
+    _UNRESOLVED_QUESTIONS = {
+        'topic': "What topic or phenomenon do you need?",
+        'geography': "Which geographic area or location do you need?",
+        'time_range': "What time period do you need?",
+        'time_granularity': "What time granularity do you need?",
+        'expected_size': "How many rows/records do you need?",
+        'output_format': "Which output format do you need?",
     }
 
     def _apply_clarification_answers(
         self,
         requirement: RequirementSpec,
         answers: Dict[str, str],
-        defaulted: Optional[set] = None
+        defaulted: Optional[set] = None,
+        accepted_defaults: Optional[set] = None,
+        unresolved_defaults: Optional[set] = None,
     ) -> RequirementSpec:
         """
         Apply user answers to the requirement spec.
 
-        Fields in `defaulted` were NOT answered by the user. The default is used as the
-        working value, but it is recorded in inferred_by_model (marked "(default)"), not in
-        explicitly_stated, and the field stays open in missing_or_unclear / clarifying_questions.
+        Explicit answers and user-accepted defaults resolve their fields. An unusable typed
+        answer may use a working fallback, but remains unresolved until clarified.
         """
         defaulted = defaulted or set()
+        accepted_defaults = (
+            set(defaulted) if accepted_defaults is None else accepted_defaults
+        )
+        unresolved_defaults = unresolved_defaults or set()
 
         def record(field: str, label: str, value: str):
-            if field in defaulted:
-                note = f'{field}: {value} (default)'
-                if note not in requirement.inferred_by_model:
-                    requirement.inferred_by_model.append(note)
+            if field in accepted_defaults:
+                note = f'{field}: {value} (accepted default)'
+                if note not in requirement.accepted_defaults:
+                    requirement.accepted_defaults.append(note)
+            elif field in defaulted or field in unresolved_defaults:
+                return
             else:
                 requirement.explicitly_stated.append(f'clarified_{label}: {value}')
 
@@ -1593,6 +1685,7 @@ Return JSON only:"""
                         requirement.is_supported = False
                         requirement.unsupported_reason = reason
                         requirement.completeness = 0.0
+                        requirement.collection_status = "rejected"
                         record(field, 'topic', value)
                         return requirement
                     try:
@@ -1604,10 +1697,12 @@ Return JSON only:"""
                         record(field, 'topic', value)
                     except Exception as e:
                         logger.error(f"Could not analyse clarified topic '{value}': {e}")
+                else:
+                    record(field, 'topic', value)
 
             elif field == 'geography':
                 requirement.geography = value.title()
-                record(field, 'geography', value)
+                record(field, 'geography', requirement.geography)
 
             elif field == 'time_range':
                 requirement.time_range = value
@@ -1633,22 +1728,39 @@ Return JSON only:"""
                 requirement.output_format = fmt
                 record(field, 'format', fmt)
 
-            # A defaulted field stays open; an answered one is closed
-            if field in defaulted:
+            if field in unresolved_defaults:
+                labels = self._MISSING_LABELS.get(field, [])
+                if not any(
+                    label in item.lower()
+                    for label in labels
+                    for item in requirement.missing_or_unclear
+                ):
+                    requirement.missing_or_unclear.extend(labels)
+                question = self._UNRESOLVED_QUESTIONS.get(field)
+                if question and question not in requirement.clarifying_questions:
+                    requirement.clarifying_questions.append(question)
+                continue
+            if field in defaulted and field not in accepted_defaults:
                 continue
 
+            # Explicit answers and accepted defaults both resolve their field.
             keywords = self._QUESTION_KEYWORDS.get(field, [])
             requirement.clarifying_questions = [
                 q for q in requirement.clarifying_questions
                 if not any(k in q.lower() for k in keywords)
             ]
-            for label in self._MISSING_LABELS.get(field, []):
-                if label in requirement.missing_or_unclear:
-                    requirement.missing_or_unclear.remove(label)
+            labels = self._MISSING_LABELS.get(field, [])
+            requirement.missing_or_unclear = [
+                item for item in requirement.missing_or_unclear
+                if not any(label in item.lower() for label in labels)
+            ]
 
-        # Remove earlier model guesses ONLY for fields the user really answered
-        answered = [f for f in answers if f not in defaulted]
-        if answered and requirement.inferred_by_model:
+        # A user's answer or accepted default supersedes prior model guesses for that field.
+        resolved = [
+            field for field in answers
+            if field not in unresolved_defaults
+        ]
+        if resolved and requirement.inferred_by_model:
             markers = {
                 'output_format': ['output_format'],
                 'expected_size': ['size'],
@@ -1660,7 +1772,7 @@ Return JSON only:"""
                 item for item in requirement.inferred_by_model
                 if not any(
                     any(m in item.lower() for m in markers.get(field, []))
-                    for field in answered
+                    for field in resolved
                 )
             ]
         self._sync_structured_fields(requirement)
@@ -1668,8 +1780,10 @@ Return JSON only:"""
         requirement.completeness = self._calculate_confidence(
             requirement.explicitly_stated,
             requirement.missing_or_unclear,
-            requirement.is_supported
+            requirement.is_supported,
+            requirement.accepted_defaults,
         )
+        self._update_collection_status(requirement)
 
         return requirement
 
@@ -1691,8 +1805,18 @@ Return JSON only:"""
         if requirement.output_format:
             print(f"   • Format: {requirement.output_format}")
 
+        if requirement.accepted_defaults:
+            print("\n✅ Accepted defaults:")
+            for item in requirement.accepted_defaults:
+                print(f"   • {item}")
+
+        if requirement.inferred_by_model:
+            print("\n🤖 Model-inferred values:")
+            for item in requirement.inferred_by_model:
+                print(f"   • {item}")
+
         if requirement.missing_or_unclear:
-            print(f"\n📝 Using defaults for:")
+            print("\n❓ Still needs clarification:")
             for item in requirement.missing_or_unclear:
                 print(f"   • {item}")
 

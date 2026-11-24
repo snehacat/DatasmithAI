@@ -917,7 +917,7 @@ def test_llm_skipped_stat_recorded(planner):
 # Leftover fixes – failing tests written first
 # ---------------------------------------------------------------------------
 
-# ---- Item 1 (RA): freshness live/recent → granularity "Hourly" -------------
+# ---- Item 1 (RA): freshness limits do not infer granularity -----------------
 
 def _make_live_aq_spec_for_ra():
     """Minimal spec that RequirementAnalyzer would produce for a live request
@@ -935,7 +935,7 @@ def _make_live_aq_spec_for_ra():
         "data_modality": "time_series",
         "expected_features": ["pm2.5", "pm10"],
         "target_variable": None,
-        "time_granularity": None,   # model returns nothing → rule must default
+        "time_granularity": None,
     })
     analyzer.llm = MagicMock()
     analyzer.llm.call.return_value = fake_response
@@ -944,26 +944,17 @@ def _make_live_aq_spec_for_ra():
     return analyzer.analyze(spec)
 
 
-def test_live_freshness_defaults_granularity_to_hourly():
-    """When freshness='live' and no granularity stated, time_granularity must be 'Hourly'."""
+def test_live_freshness_does_not_infer_granularity():
+    """Live freshness retains its age limit without inventing a time granularity."""
     spec = _make_live_aq_spec_for_ra()
-    assert spec.requirement.time_granularity == "Hourly", (
-        f"Expected 'Hourly', got {spec.requirement.time_granularity!r}"
-    )
+    assert spec.requirement.time_granularity is None
+    assert spec.requirement.freshness_need == "live"
+    assert spec.requirement.max_data_age == "1 hour"
+    assert spec.requirement.max_data_age_hours == 1
 
 
-def test_live_freshness_granularity_label_in_inferred():
-    """The inferred_by_model entry must contain '(default for live data)'."""
-    spec = _make_live_aq_spec_for_ra()
-    matches = [n for n in spec.requirement.inferred_by_model if "default for live" in n]
-    assert matches, (
-        f"Expected an inferred_by_model entry with '(default for live data)'. "
-        f"Got: {spec.requirement.inferred_by_model}"
-    )
-
-
-def test_recent_freshness_defaults_granularity_to_hourly():
-    """When freshness='recent' and no granularity stated, time_granularity must be 'Hourly'."""
+def test_recent_freshness_does_not_infer_granularity():
+    """Recent freshness retains its age limit without inventing a time granularity."""
     from agents.requirement_analyzer import RequirementAnalyzer
     from unittest.mock import MagicMock
     from types import SimpleNamespace
@@ -983,16 +974,17 @@ def test_recent_freshness_defaults_granularity_to_hourly():
 
     spec = create_initial_spec("AQ test", "recent air quality data for Delhi")
     spec = analyzer.analyze(spec)
-    assert spec.requirement.time_granularity == "Hourly", (
-        f"Expected 'Hourly' for recent freshness, got {spec.requirement.time_granularity!r}"
-    )
+    assert spec.requirement.time_granularity is None
+    assert spec.requirement.freshness_need == "recent"
+    assert spec.requirement.max_data_age == "24 hours"
+    assert spec.requirement.max_data_age_hours == 24
 
 
 # ---- Item 2: deduplicate missing_or_unclear / "Using defaults for" ----------
 
 def test_missing_or_unclear_has_no_duplicate_size_entries():
     """missing_or_unclear must not contain both 'dataset size' and
-    'dataset size depends on number of stations' as separate entries."""
+    'dataset size depends on its data sources and time range' as separate entries."""
     from agents.requirement_analyzer import RequirementAnalyzer
     from unittest.mock import MagicMock
     from types import SimpleNamespace
@@ -1020,9 +1012,8 @@ def test_missing_or_unclear_has_no_duplicate_size_entries():
     assert len(size_entries) == 1, (
         f"Expected exactly one size entry in missing_or_unclear, got {size_entries}"
     )
-    # The single entry must carry the informative suffix
-    assert "station" in size_entries[0], (
-        f"The size entry should mention stations, got {size_entries[0]!r}"
+    assert "selected data sources and time range" in size_entries[0], (
+        f"The size entry should mention its data sources and time range, got {size_entries[0]!r}"
     )
 
 
@@ -1206,8 +1197,8 @@ def test_plan_confidence_field_description_says_match():
 
 # ---- Item 7: welcome banner -------------------------------------------------
 
-def test_welcome_banner_says_dataset_builder(capsys):
-    """main.py banner must read 'DataSmith AI - Dataset Builder'."""
+def test_welcome_banner_says_requirement_analysis_and_planning(capsys):
+    """main.py banner must say 'DataSmith AI - Dataset Requirement Analysis and Planning'."""
     import importlib
     import main as main_module
     # Patch all I/O so main() doesn't block
@@ -1220,7 +1211,7 @@ def test_welcome_banner_says_dataset_builder(capsys):
         except (SystemExit, StopIteration, Exception):
             pass
     out = capsys.readouterr().out
-    assert "DataSmith AI - Dataset Builder" in out, (
+    assert "DataSmith AI - Dataset Requirement Analysis and Planning" in out, (
         f"Banner not found. Output started with: {out[:200]!r}"
     )
 

@@ -43,7 +43,10 @@ def test_topic_question_only_when_no_domain():
     a = make_analyzer(interactive=True)
     req = RequirementSpec(dataset_name="X", description="rainfall csv", domain="environmental",
                           geography="Delhi", time_range="last 7 days", expected_size="500 rows",
-                          output_format="csv", completeness=0.1)
+                          output_format="csv", completeness=0.1,
+                          explicitly_stated=[
+                              "geography: Delhi", "time_range: last 7 days", "dataset_size: 500"
+                          ])
     with patch('builtins.input', side_effect=AssertionError("no question should be asked")):
         out = a._bounded_clarification(req, "X", "rainfall csv")
     assert out is req  # nothing asked, nothing changed
@@ -53,7 +56,10 @@ def test_topic_question_asked_when_no_domain():
     a = make_analyzer(interactive=True)
     req = RequirementSpec(dataset_name="X", description="stuff csv", domain=None,
                           geography="Delhi", time_range="last 7 days", expected_size="500 rows",
-                          output_format="csv")
+                          output_format="csv",
+                          explicitly_stated=[
+                              "geography: Delhi", "time_range: last 7 days", "dataset_size: 500"
+                          ])
     inputs = iter(["rainfall data for kerala"])
     with patch('builtins.input', side_effect=lambda prompt="": next(inputs)), \
          patch.object(a, '_analyze_with_llm', return_value=llm_result(domain="meteorological")):
@@ -95,7 +101,8 @@ def test_typed_size_in_clarification_is_accepted():
     a = make_analyzer(interactive=True)
     req = RequirementSpec(dataset_name="X", description="rainfall csv", domain="environmental",
                           geography="Delhi", time_range="last 7 days", expected_size=None,
-                          output_format="csv", missing_or_unclear=["dataset size"])
+                          output_format="csv", missing_or_unclear=["dataset size"],
+                          explicitly_stated=["geography: Delhi", "time_range: last 7 days"])
     inputs = iter(["2000 rows"])
     with patch('builtins.input', side_effect=lambda prompt="": next(inputs)):
         out = a._bounded_clarification(req, "X", "rainfall csv")
@@ -142,7 +149,10 @@ def test_option_4_for_granularity_means_yearly_not_custom():
     a = make_analyzer(interactive=True)
     req = RequirementSpec(dataset_name="X", description="weather csv", domain="meteorological",
                           geography="Delhi", time_range="2010 to 2020", expected_size="500 rows",
-                          output_format="csv")
+                          output_format="csv",
+                          explicitly_stated=[
+                              "geography: Delhi", "time_range: 2010 to 2020", "dataset_size: 500"
+                          ])
     inputs = iter(["4"])   # a second input() call would raise StopIteration
     with patch('builtins.input', side_effect=lambda prompt="": next(inputs)):
         out = a._bounded_clarification(req, "X", "weather csv")
@@ -152,7 +162,8 @@ def test_option_4_for_granularity_means_yearly_not_custom():
 def test_option_4_for_size_is_custom_and_reads_one_line():
     a = make_analyzer(interactive=True)
     req = RequirementSpec(dataset_name="X", description="weather csv", domain="meteorological",
-                          geography="Delhi", time_range="last 7 days", output_format="csv")
+                          geography="Delhi", time_range="last 7 days", output_format="csv",
+                          explicitly_stated=["geography: Delhi", "time_range: last 7 days"])
     inputs = iter(["4", "3,500"])
     with patch('builtins.input', side_effect=lambda prompt="": next(inputs)):
         out = a._bounded_clarification(req, "X", "weather csv")
@@ -458,6 +469,7 @@ def test_granularity_asked_after_multi_year_range_chosen_in_clarification(monkey
         description="flood data for bihar csv 1000 rows",
         domain="hydrological", geography="Bihar",
         expected_size="1000 rows", output_format="csv",
+        explicitly_stated=["geography: Bihar", "dataset_size: 1000"],
     )
     result = a._bounded_clarification(req, "Flood", req.description)
 

@@ -1075,7 +1075,8 @@ class TestNewFixes:
             domain="meteorological",
             geography="Delhi",
             expected_size="500 rows",
-            output_format="csv"
+            output_format="csv",
+            explicitly_stated=["geography: Delhi", "dataset_size: 500"],
         )
         
         # Only the time-range question is asked.
@@ -1121,28 +1122,44 @@ class TestLLMPayloadRobustness:
                           return_value=Mock(content={"domain": "environmental"})) as m:
             analyzer.analyze(create_initial_spec("Rain", "rainfall data in Kerala"))
         assert m.call_args.kwargs.get('expected_schema') is None
-class TestDefaultsAreNotExplicit:
+class TestClarificationProvenance:
     def _req(self):
         return RequirementSpec(
             dataset_name="T", description="d", domain="environmental",
             missing_or_unclear=['geographic area', 'dataset size'],
-            clarifying_questions=["Which geographic area or location do you need?"],
+            clarifying_questions=[
+                "Which geographic area or location do you need?",
+                "How many rows/records do you need?",
+            ],
         )
 
-    def test_default_is_inferred_not_explicit(self):
+    def test_default_is_recorded_separately_and_resolves_the_field(self):
         analyzer = RequirementAnalyzer()
         req = analyzer._apply_clarification_answers(self._req(), {'geography': 'global'}, {'geography'})
         assert req.geography == 'Global'
         assert not any('geography' in s for s in req.explicitly_stated)
-        assert 'geography: global (default)' in req.inferred_by_model
-        assert 'geographic area' in req.missing_or_unclear
+        assert 'geography: Global (accepted default)' in req.accepted_defaults
+        assert not any('geography' in s for s in req.inferred_by_model)
+        assert 'geographic area' not in req.missing_or_unclear
+        assert req.collection_status == "needs_clarification"
+        assert req.clarifying_questions == ["How many rows/records do you need?"]
 
     def test_user_answer_is_explicit_and_closes_question(self):
         analyzer = RequirementAnalyzer()
         req = analyzer._apply_clarification_answers(self._req(), {'geography': 'Kerala'}, set())
         assert 'clarified_geography: Kerala' in req.explicitly_stated
         assert 'geographic area' not in req.missing_or_unclear
-        assert req.clarifying_questions == []
+        assert req.clarifying_questions == ["How many rows/records do you need?"]
+        assert req.collection_status == "needs_clarification"
+
+    def test_explicit_values_resolve_all_tracked_fields(self):
+        analyzer = RequirementAnalyzer()
+        req = analyzer._apply_clarification_answers(
+            self._req(),
+            {"geography": "Kerala", "expected_size": "2000 rows"},
+        )
+        assert req.missing_or_unclear == []
+        assert req.collection_status == "collected"
 
     def test_unusable_typed_answer_counts_as_default(self):
         analyzer = RequirementAnalyzer(interactive=True)
@@ -1164,8 +1181,161 @@ class TestDefaultsAreNotExplicit:
         before = req.completeness
         with patch('builtins.input', side_effect=iter([""] * 10)):
             req = analyzer._bounded_clarification(req, "Rain Study", "rainfall data")
-        assert req.completeness <= before
+        assert req.completeness > before
+        assert req.completeness < 1.0
+        assert req.accepted_defaults
         assert not any(s.startswith('clarified_') for s in req.explicitly_stated)
+
+    def test_flood_prediction_accepting_defaults_resolves_geo_and_size(self, capsys):
+        analyzer = RequirementAnalyzer(interactive=True)
+        spec = create_initial_spec("Flood", "flood prediction dataset")
+        payload = {
+            "domain": "hydrological",
+            "subdomain": "flooding",
+            "problem_type": "prediction",
+            "data_modality": "time_series",
+            "time_granularity": "daily",
+            "expected_features": [],
+        }
+        with patch.object(analyzer.llm, 'call', return_value=Mock(content=payload)), \
+             patch.object(analyzer, '_read_input', return_value=""):
+            result = analyzer.analyze(spec)
+
+        requirement = result.requirement
+        output = capsys.readouterr().out
+        assert requirement.description == "flood prediction dataset"
+        assert requirement.geography == "Global"
+        assert requirement.expected_size == "1000 rows"
+        assert requirement.time_granularity == "Daily"
+        assert "time_granularity: Daily (model guess)" in requirement.inferred_by_model
+        assert not any("time_granularity" in item for item in requirement.accepted_defaults)
+        assert "geographic area" not in requirement.missing_or_unclear
+        assert not any("dataset size" in item for item in requirement.missing_or_unclear)
+        assert any("geography: Global (accepted default)" == item
+                   for item in requirement.accepted_defaults)
+        assert any("expected_size: 1000 rows (accepted default)" == item
+                   for item in requirement.accepted_defaults)
+        assert not any("(accepted default)" in item for item in requirement.inferred_by_model)
+        assert requirement.collection_status == "collected_with_defaults"
+        assert requirement.completeness < 1.0
+        assert "Requirements confirmed" not in output
+        assert "Requirements collected with accepted defaults" in output
+
+    def test_invalid_typed_size_remains_unresolved(self):
+        analyzer = RequirementAnalyzer(interactive=True)
+        requirement = RequirementSpec(
+            dataset_name="Weather",
+            description="weather data csv",
+            domain="meteorological",
+            geography="Global",
+            time_range="latest available",
+            output_format="csv",
+            missing_or_unclear=["dataset size"],
+            clarifying_questions=["How many rows/records do you need?"],
+        )
+        with patch.object(analyzer, '_read_input', return_value="lots"):
+            updated = analyzer._bounded_clarification(
+                requirement, "Weather", "weather data csv"
+            )
+        assert updated.expected_size == "1000 rows"
+        assert "dataset size" in updated.missing_or_unclear
+        assert updated.clarifying_questions == ["How many rows/records do you need?"]
+        assert not updated.accepted_defaults
+        assert updated.collection_status == "needs_clarification"
+
+    def test_model_inferences_are_not_user_accepted_values(self):
+        analyzer = RequirementAnalyzer()
+        payload = {
+            "domain": "hydrological",
+            "subdomain": "flooding",
+            "problem_type": "prediction",
+            "data_modality": "time_series",
+            "expected_features": ["rainfall"],
+        }
+        with patch.object(analyzer, '_analyze_with_llm', return_value=LLMRequirementAnalysis(**payload)):
+            requirement = analyzer._analyze_requirement("Flood", "flood prediction dataset")
+        assert "domain" in requirement.inferred_by_model
+        assert "expected_features" in requirement.inferred_by_model
+        assert not requirement.accepted_defaults
+        assert requirement.collection_status == "needs_clarification"
+
+    def test_model_inferred_geography_is_clarified(self, capsys):
+        analyzer = RequirementAnalyzer(interactive=True)
+        requirement = RequirementSpec(
+            dataset_name="Weather",
+            description="weather daily csv",
+            domain="meteorological",
+            geography="Delhi",
+            time_range="last 7 days",
+            expected_size="500 rows",
+            explicitly_stated=["time_range: last 7 days", "dataset_size: 500"],
+            inferred_by_model=["geography: Delhi (model guess)"],
+        )
+        with patch.object(analyzer, '_read_input', return_value=""):
+            updated = analyzer._bounded_clarification(requirement, "Weather", "weather daily csv")
+
+        assert "Which location or geographic area?" in capsys.readouterr().out
+        assert updated.geography == "Delhi"
+        assert "geography: Delhi (accepted default)" in updated.accepted_defaults
+
+    def test_model_inferred_dataset_size_is_clarified(self, capsys):
+        analyzer = RequirementAnalyzer(interactive=True)
+        requirement = RequirementSpec(
+            dataset_name="Weather",
+            description="weather daily csv",
+            domain="meteorological",
+            geography="Delhi",
+            time_range="last 7 days",
+            expected_size="5000 rows",
+            explicitly_stated=["geography: Delhi", "time_range: last 7 days"],
+            inferred_by_model=["expected_size: 5000 rows (model guess)"],
+        )
+        with patch.object(analyzer, '_read_input', return_value=""):
+            updated = analyzer._bounded_clarification(requirement, "Weather", "weather daily csv")
+
+        assert "How many rows/records do you need?" in capsys.readouterr().out
+        assert updated.expected_size == "5000 rows"
+        assert "expected_size: 5000 rows (accepted default)" in updated.accepted_defaults
+
+    def test_model_inferred_time_range_is_clarified(self, capsys):
+        analyzer = RequirementAnalyzer(interactive=True)
+        requirement = RequirementSpec(
+            dataset_name="Weather",
+            description="weather daily csv",
+            domain="meteorological",
+            geography="Delhi",
+            time_range="2020 to 2022",
+            expected_size="500 rows",
+            time_granularity="Daily",
+            explicitly_stated=["geography: Delhi", "dataset_size: 500"],
+            inferred_by_model=["time_range: 2020 to 2022 (model guess)"],
+        )
+        with patch.object(analyzer, '_read_input', return_value=""):
+            updated = analyzer._bounded_clarification(requirement, "Weather", "weather daily csv")
+
+        assert "What time period do you need?" in capsys.readouterr().out
+        assert updated.time_range == "2020 to 2022"
+        assert "time_range: 2020 to 2022 (accepted default)" in updated.accepted_defaults
+
+    def test_explicit_and_accepted_values_do_not_prompt_again(self):
+        analyzer = RequirementAnalyzer(interactive=True)
+        requirement = RequirementSpec(
+            dataset_name="Weather",
+            description="weather daily csv",
+            domain="meteorological",
+            geography="Delhi",
+            time_range="last 7 days",
+            expected_size="1000 rows",
+            explicitly_stated=["geography: Delhi", "time_range: last 7 days"],
+            accepted_defaults=["expected_size: 1000 rows (accepted default)"],
+        )
+        with patch.object(analyzer, '_read_input') as read_input:
+            updated = analyzer._bounded_clarification(requirement, "Weather", "weather daily csv")
+
+        read_input.assert_not_called()
+        assert updated.geography == "Delhi"
+        assert updated.time_range == "last 7 days"
+        assert updated.expected_size == "1000 rows"
 class TestGeographySpecificity:
     def geo(self, text):
         return RequirementAnalyzer()._extract_geography(text, [], [])

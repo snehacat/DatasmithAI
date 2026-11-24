@@ -103,7 +103,13 @@ class RequirementSpec(SpecModel):
     is_supported: bool = Field(True, description="Whether this is supported in current version")
     unsupported_reason: Optional[str] = Field(None, description="Why not supported")
     explicitly_stated: List[str] = Field(default_factory=list, description="What user explicitly said")
+    accepted_defaults: List[str] = Field(
+        default_factory=list, description="Values the user accepted from displayed defaults"
+    )
     inferred_by_model: List[str] = Field(default_factory=list, description="What model inferred")
+    collection_status: Literal[
+        "collected", "collected_with_defaults", "needs_clarification", "rejected"
+    ] = Field("needs_clarification", description="Requirement collection outcome")
     
     # Completeness (how much detail the user provided)
     completeness: float = Field(0.0, ge=0.0, le=1.0, description="Request completeness (0-1, based on detail provided)")
