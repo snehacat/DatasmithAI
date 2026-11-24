@@ -124,6 +124,11 @@ class SourceRequirement(SpecModel):
     importance: Literal["required", "useful", "fallback", "optional"] = Field(..., description="How important")
     preferred_access_methods: List[str] = Field(default_factory=list, description="How to access (api, download, etc)")
     priority: int = Field(..., ge=1, description="Priority (1=highest)")
+    data_origin: str = Field("measured", description="Origin of data: measured, modeled, or mixed")
+    connector_available: bool = Field(
+        False,
+        description="Whether DataSmith has an implemented connector for this source type",
+    )
 
 
 class SearchQuery(SpecModel):
@@ -140,14 +145,31 @@ class PlanSpec(SpecModel):
     # Core strategy
     source_requirements: List[SourceRequirement] = Field(default_factory=list, description="Required source types")
     search_queries: List[SearchQuery] = Field(default_factory=list, description="Queries to execute")
+    uncovered_features: List[str] = Field(
+        default_factory=list,
+        description="Requested features not advertised by any selected source",
+    )
     
     # Strategy
-    primary_source_types: List[str] = Field(default_factory=list, description="Primary sources to try first")
+    primary_source_types: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Sources prioritized for discovery; some may not have implemented connectors"
+        ),
+    )
     fallback_source_types: List[str] = Field(default_factory=list, description="Fallback if primary fails")
     reasoning: Optional[str] = Field(None, description="Overall strategy reasoning")
     
     # Confidence
-    confidence: float = Field(0.0, ge=0.0, le=1.0, description="Plan confidence")
+    confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Plan match confidence based on topic, geography, feature coverage, "
+            "freshness, and primary-source fit"
+        ),
+    )
 
 
 # ============================================================================
@@ -340,6 +362,21 @@ def validate_spec(spec: DatasetSpec) -> tuple[bool, List[str]]:
     
     if spec.retrieval and not spec.plan:
         errors.append("Retrieval exists but plan missing (agents out of order)")
+
+    if spec.plan:
+        source_types = {source.source_type for source in spec.plan.source_requirements}
+        source_priorities = [source.priority for source in spec.plan.source_requirements]
+        query_priorities = [query.priority for query in spec.plan.search_queries]
+        if len(source_priorities) != len(set(source_priorities)):
+            errors.append("Plan source requirement priorities must be unique")
+        if len(query_priorities) != len(set(query_priorities)):
+            errors.append("Plan search query priorities must be unique")
+        for query in spec.plan.search_queries:
+            if query.related_source_type not in source_types:
+                errors.append(
+                    f"Search query source type '{query.related_source_type}' "
+                    "does not match a source requirement"
+                )
     
     # Check provenance on sources
     if spec.retrieval:
