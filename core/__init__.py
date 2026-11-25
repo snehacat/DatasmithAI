@@ -23,6 +23,10 @@ from .llm_wrapper import (
     LLMWrapper,
     LLMConfig,
     LLMResponse,
+    LLMError,
+    LLMConnectionError,
+    LLMTimeoutError,
+    LLMResponseError,
     get_llm,
     reset_llm
 )
@@ -52,6 +56,10 @@ __all__ = [
     'LLMWrapper',
     'LLMConfig',
     'LLMResponse',
+    'LLMError',
+    'LLMConnectionError',
+    'LLMTimeoutError',
+    'LLMResponseError',
     'get_llm',
     'reset_llm',
     

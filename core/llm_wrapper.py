@@ -17,7 +17,7 @@ import time
 import logging
 import os
 from typing import Dict, Any, Optional, Type
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 import httpx
 import ollama
 from ollama import Client as OllamaClient
@@ -25,6 +25,22 @@ from ollama import Client as OllamaClient
 
 # Setup logging
 logger = logging.getLogger(__name__)
+
+
+class LLMError(RuntimeError):
+    """Base class for expected failures while requesting an LLM response."""
+
+
+class LLMConnectionError(LLMError):
+    """The configured Ollama service could not be reached."""
+
+
+class LLMTimeoutError(LLMError, TimeoutError):
+    """An LLM request or total call exceeded its timeout."""
+
+
+class LLMResponseError(LLMError):
+    """The LLM service returned an unusable or invalid response."""
 
 
 class LLMConfig(BaseModel):
@@ -107,9 +123,10 @@ class LLMWrapper:
             failures are raised, never returned.
 
         Raises:
-            RuntimeError: Ollama is unreachable, or all attempts failed
-                          (bad JSON, wrong shape, or schema validation error).
-            TimeoutError: the total timeout was exceeded.
+            LLMConnectionError: Ollama is unreachable.
+            LLMTimeoutError: a request or total timeout was exceeded.
+            LLMResponseError: all response parsing or validation attempts failed.
+            LLMError: Ollama returned an unsuccessful provider response.
         """
         self.call_count += 1
         overall_start_time = time.time()
@@ -119,6 +136,7 @@ class LLMWrapper:
         
         last_error = None
         validation_error = None
+        validation_cause = None
         
         for attempt in range(self.config.max_retries + 1):  # max_retries + initial attempt
             # Check total timeout
@@ -130,7 +148,7 @@ class LLMWrapper:
                     f"after {attempt} attempt(s). Total time: {duration:.2f}s"
                 )
                 logger.error(error_msg)
-                raise TimeoutError(error_msg)
+                raise LLMTimeoutError(error_msg)
             
             # Calculate remaining time for this attempt
             remaining_total = self.config.total_timeout_seconds - elapsed
@@ -143,7 +161,7 @@ class LLMWrapper:
                     f"before attempt {attempt + 1}. Total time: {duration:.2f}s"
                 )
                 logger.error(error_msg)
-                raise TimeoutError(error_msg)
+                raise LLMTimeoutError(error_msg)
             
             attempt_start = time.time()
             
@@ -204,12 +222,14 @@ class LLMWrapper:
                     if call_duration > attempt_timeout:
                         logger.warning(f"Call took {call_duration:.2f}s, exceeded attempt timeout of {attempt_timeout:.2f}s")
                         
-                except (
-                    ConnectionError,
-                    httpx.ConnectError,
-                    httpx.TimeoutException,
-                ) as e:
-                    # Connection error - fail immediately
+                except (httpx.TimeoutException, TimeoutError) as e:
+                    error_msg = (
+                        f"Ollama request timed out after {time.time() - overall_start_time:.2f}s. "
+                        f"Error: {e}"
+                    )
+                    logger.error(error_msg)
+                    raise LLMTimeoutError(error_msg) from e
+                except (ConnectionError, httpx.TransportError) as e:
                     duration = time.time() - overall_start_time
                     error_msg = (
                         f"Cannot connect to Ollama service after {duration:.2f}s. "
@@ -217,27 +237,38 @@ class LLMWrapper:
                         f"Error: {e}"
                     )
                     logger.error(error_msg)
-                    raise RuntimeError(error_msg) from e
-                except Exception as e:
+                    raise LLMConnectionError(error_msg) from e
+                except (json.JSONDecodeError, httpx.DecodingError, ValidationError) as e:
+                    raise LLMResponseError(
+                        f"Ollama returned an invalid response: {e}"
+                    ) from e
+                except ollama.ResponseError as e:
                     message = str(e).lower()
                     if "model" in message and ("not found" in message or "does not exist" in message):
                         error_msg = f"Run: ollama pull {self.config.model_name}"
                         logger.error(error_msg)
-                        raise RuntimeError(error_msg) from e
-                    # Check if it's a connection-related error
-                    if 'connection' in str(e).lower() or 'refused' in str(e).lower():
-                        duration = time.time() - overall_start_time
-                        error_msg = (
-                            f"Cannot connect to Ollama service after {duration:.2f}s. "
-                            f"Please ensure Ollama is running (ollama serve). "
-                            f"Error: {e}"
-                        )
-                        logger.error(error_msg)
-                        raise RuntimeError(error_msg) from e
-                    raise
+                        raise LLMError(error_msg) from e
+                    raise LLMResponseError(f"Ollama returned an error response: {e}") from e
                 
                 # Extract content
-                raw_text = response['message']['content']
+                try:
+                    raw_text = response["message"]["content"]
+                except (KeyError, TypeError) as e:
+                    validation_error = f"invalid response structure: {e}"
+                    last_error = validation_error
+                    validation_cause = e
+                    logger.warning(validation_error)
+                    if attempt >= self.config.max_retries:
+                        break
+                    continue
+                if not isinstance(raw_text, str):
+                    validation_error = "response content was not a string"
+                    last_error = validation_error
+                    validation_cause = None
+                    logger.warning(validation_error)
+                    if attempt >= self.config.max_retries:
+                        break
+                    continue
                 self._log_ollama_stats(response)
                 attempt_duration = time.time() - attempt_start
                 logger.debug(f"Attempt {attempt + 1} completed in {attempt_duration:.2f}s")
@@ -250,6 +281,7 @@ class LLMWrapper:
                     logger.warning(f"JSON parse failed: {e}")
                     last_error = f"JSON parse error: {e}"
                     validation_error = f"response was not valid JSON ({e})"
+                    validation_cause = e
                     if attempt >= self.config.max_retries:
                         break
                     continue
@@ -260,6 +292,7 @@ class LLMWrapper:
                     )
                     logger.warning(f"Unusable JSON shape: {validation_error}")
                     last_error = f"JSON shape error: {validation_error}"
+                    validation_cause = None
                     if attempt >= self.config.max_retries:
                         break
                     continue
@@ -271,10 +304,11 @@ class LLMWrapper:
                         # pydantic v2: model_dump(); v1 fallback: dict()
                         content = validated.model_dump() if hasattr(validated, "model_dump") else validated.dict()
                         logger.debug("Schema validation passed")
-                    except Exception as e:
+                    except ValidationError as e:
                         validation_error = str(e)
                         logger.warning(f"Schema validation failed: {validation_error[:200]}")
                         last_error = f"Schema validation error: {validation_error}"
+                        validation_cause = e
                         if attempt >= self.config.max_retries:
                             break
                         continue
@@ -292,15 +326,8 @@ class LLMWrapper:
                     retries_used=attempt
                 )
                 
-            except (RuntimeError, TimeoutError):
-                # Re-raise connection errors and timeouts immediately
+            except LLMError:
                 raise
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"Attempt {attempt + 1} failed: {last_error[:200]}")
-                
-                if attempt >= self.config.max_retries:
-                    break
         
         # All attempts exhausted
         duration = time.time() - overall_start_time
@@ -309,7 +336,9 @@ class LLMWrapper:
             f"in {duration:.2f}s. Last error: {last_error}"
         )
         logger.error(error_msg)
-        raise RuntimeError(error_msg)
+        if validation_cause is not None:
+            raise LLMResponseError(error_msg) from validation_cause
+        raise LLMResponseError(error_msg)
     @staticmethod
     def _log_ollama_stats(response):
         """Log Ollama's own numbers: tokens in/out and where the time went."""

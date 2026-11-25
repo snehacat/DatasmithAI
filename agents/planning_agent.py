@@ -8,10 +8,11 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from core.dataset_spec import (
     DatasetSpec,
     PlanSpec,
+    RequirementSpec,
     SearchQuery,
     SourceRequirement,
 )
-from core.llm_wrapper import get_llm
+from core.llm_wrapper import LLMError, LLMResponseError, get_llm
 
 from .source_catalog import SOURCE_CATALOG, SourceCatalogEntry, normalize_feature_name
 
@@ -30,8 +31,17 @@ _INDIA_LOCATIONS = {
 _US_LOCATIONS = {
     "us", "usa", "united states", "texas", "california", "florida", "alaska",
     "hawaii", "louisiana", "oklahoma", "nevada", "oregon", "washington state",
-    "arizona", "colorado",
+    "arizona", "colorado", "new york",
 }
+_OTHER_KNOWN_LOCATIONS = {
+    "united kingdom", "uk", "england", "scotland", "wales", "ireland",
+    "canada", "mexico", "brazil", "argentina", "chile", "france", "germany",
+    "spain", "italy", "portugal", "netherlands", "china", "japan", "south korea",
+    "north korea", "singapore", "thailand", "vietnam", "indonesia", "philippines",
+    "australia", "new zealand", "south africa", "egypt", "nigeria", "kenya",
+    "saudi arabia", "united arab emirates", "uae", "russia",
+}
+_KNOWN_LOCATIONS = _INDIA_LOCATIONS | _US_LOCATIONS | _OTHER_KNOWN_LOCATIONS
 _ALIASES = {
     "air quality": {"air quality", "pollution", "pm2.5", "pm10", "aqi", "ozone", "no2", "so2"},
     "fire": {"fire", "wildfire", "forest fire", "forest fire monitoring"},
@@ -103,12 +113,12 @@ class PlanningAgent:
         dom = (domain or "").lower().strip()
         specific: Set[str] = set()
         for key, aliases in _ALIASES.items():
-            if any(alias in sub for alias in aliases):
+            if any(PlanningAgent._phrase_present(alias, sub) for alias in aliases):
                 specific.update(aliases)
                 specific.add(key)
         domain_terms: Set[str] = set()
         for key, aliases in _ALIASES.items():
-            if any(term in dom for term in aliases | {key}):
+            if any(PlanningAgent._phrase_present(term, dom) for term in aliases | {key}):
                 domain_terms.update(aliases)
                 domain_terms.add(key)
         if dom == "environmental":
@@ -119,9 +129,23 @@ class PlanningAgent:
     def _overlaps(left: Sequence[str], right: Set[str]) -> bool:
         normalized = [value.lower().strip() for value in left]
         for value in normalized:
-            if value in right or any(value in term or term in value for term in right):
+            if value in right:
+                return True
+            if any(PlanningAgent._phrase_present(term, value) or PlanningAgent._phrase_present(value, term)
+                   for term in right):
                 return True
         return False
+
+    @staticmethod
+    def _phrase_present(phrase: str, text: str) -> bool:
+        """Match an alias or topic as a normalized word/phrase, never as an arbitrary substring."""
+        if not phrase or not text:
+            return False
+        normalized_phrase = re.sub(r"[^a-z0-9]+", " ", phrase.lower()).strip()
+        normalized_text = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        if not normalized_phrase or not normalized_text:
+            return False
+        return re.search(rf"(?:^| ){re.escape(normalized_phrase)}(?: |$)", f" {normalized_text} ") is not None
 
     @staticmethod
     def _feature_matches(entry: SourceCatalogEntry, features: Sequence[str]) -> List[str]:
@@ -204,7 +228,15 @@ class PlanningAgent:
             temporal_score = int(self._temporal_match(entry, fresh, requirement.time_range))
             access_score = int(fresh in {"live", "recent"} and entry.access == "api")
             topic_score = int(self._overlaps(entry.covers, specific or domain_terms))
-            return (topic_score, temporal_score, geography_score, access_score, feature_score)
+            connector_score = int(entry.connector_available)
+            return (
+                topic_score,
+                feature_score,
+                temporal_score,
+                geography_score,
+                connector_score,
+                access_score,
+            )
 
         candidates.sort(key=rank, reverse=True)
         return candidates, temporal_matches
@@ -322,6 +354,127 @@ class PlanningAgent:
         words.update(base.split())
         return words
 
+    @classmethod
+    def _normalize_search_query(cls, query: str) -> str:
+        normalized = re.sub(r"\s+", " ", query.strip()).casefold()
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized
+
+    @classmethod
+    def _mentioned_locations(cls, text: str) -> Set[str]:
+        """Find explicitly known geographic names using word/phrase boundaries."""
+        matches: Set[str] = set()
+        for place in sorted(_KNOWN_LOCATIONS, key=len, reverse=True):
+            if cls._phrase_present(place, text):
+                matches.add(place)
+        return matches
+
+    @staticmethod
+    def _country_aliases() -> Set[str]:
+        return {"india", "us", "usa", "united states"}
+
+    @classmethod
+    def _location_country(cls, location: str) -> Optional[str]:
+        if location in {"india"} or location in _INDIA_LOCATIONS:
+            return "india"
+        if location in {"us", "usa", "united states"} or location in _US_LOCATIONS:
+            return "us"
+        return location
+
+    @classmethod
+    def _locations_compatible(
+        cls,
+        requested_text: str,
+        query_text: str,
+    ) -> bool:
+        """Validate known location names without assuming complete geocoding."""
+        requested = cls._mentioned_locations(requested_text)
+        queried = cls._mentioned_locations(query_text)
+        if not requested:
+            return not queried
+        if not queried:
+            return True
+
+        country_aliases = cls._country_aliases()
+        requested_countries = {
+            cls._location_country(location)
+            for location in requested
+            if cls._location_country(location)
+        }
+        queried_countries = {
+            cls._location_country(location)
+            for location in queried
+            if cls._location_country(location)
+        }
+        if not requested_countries.intersection(queried_countries):
+            return False
+
+        requested_exact = requested - country_aliases
+        queried_exact = queried - country_aliases
+        requested_is_country_only = bool(requested & country_aliases) and not requested_exact
+
+        if requested_is_country_only:
+            return all(
+                cls._location_country(location) in requested_countries
+                for location in queried_exact
+            )
+
+        if requested_exact:
+            return all(location in requested_exact for location in queried_exact)
+
+        return True
+
+    @classmethod
+    def _llm_query_relevant(
+        cls,
+        query: str,
+        requirement: RequirementSpec,
+        phenomenon: str,
+    ) -> bool:
+        """Deterministic relevance checks for LLM-generated search suggestions."""
+        q_low = cls._normalize_search_query(query)
+        if not q_low or "http" in q_low or "www." in q_low:
+            return False
+
+        topic_terms = cls._subdomain_synonyms(phenomenon)
+
+        topic_match = any(cls._phrase_present(str(term), q_low) for term in topic_terms)
+        if not topic_match:
+            return False
+
+        # Reject a query that explicitly identifies a different top-level topic.
+        requirement_topics = cls._topics(requirement.subdomain, requirement.domain)[0]
+        for topic_key, aliases in _ALIASES.items():
+            if topic_key in requirement_topics:
+                continue
+            if any(cls._phrase_present(alias, q_low) for alias in aliases):
+                # A generic alias such as "temperature" can legitimately belong to
+                # multiple domains, so require an explicit strong topic phrase.
+                if any(cls._phrase_present(alias, q_low) for alias in (
+                    "earthquake", "wildfire", "forest fire", "flood", "ocean", "satellite",
+                    "air quality", "pollution",
+                ) if alias in aliases):
+                    return False
+
+        # If features are explicitly requested, a generated query must retain at
+        # least one exact requested feature or a controlled alias. Topic terms
+        # alone are not enough to prove feature preservation.
+        if requirement.expected_features:
+            for feature in requirement.expected_features:
+                feature_norm = normalize_feature_name(feature)
+                if feature_norm and cls._phrase_present(feature_norm, q_low):
+                    break
+                if cls._phrase_present(feature, q_low):
+                    break
+            else:
+                return False
+
+        if requirement.geography:
+            if not cls._locations_compatible(requirement.geography, q_low):
+                return False
+
+        return True
+
     def _llm_refinement(self, plan: PlanSpec, spec: DatasetSpec, use_llm: bool = True) -> None:
         fallback_reasoning = self._rule_reasoning(spec)
 
@@ -343,8 +496,6 @@ class PlanningAgent:
             return
 
         phenomenon = self._matched_phenomenon(spec.requirement)
-        synonyms = self._subdomain_synonyms(phenomenon)
-
         prompt = (
             "Refine this source-search plan. Return JSON with keys "
             '"extra_queries" (up to 3 short strings) and "reasoning" (one sentence). '
@@ -355,7 +506,7 @@ class PlanningAgent:
             response = self._call_llm(prompt=prompt, expected_schema=None)
             content = getattr(response, "content", None)
             if not isinstance(content, dict):
-                raise ValueError("planner response was not a JSON object")
+                raise LLMResponseError("planner response was not a JSON object")
             raw_queries = content.get("extra_queries", [])
             raw_reasoning = content.get("reasoning")
             queries: List[str] = []
@@ -369,11 +520,22 @@ class PlanningAgent:
                         and "www." not in q.lower()
                     ):
                         continue
-                    q_low = q.lower()
-                    # Discard any query that shares no word with the subdomain synonyms
-                    if not any(syn in q_low for syn in synonyms):
+                    normalized_query = self._normalize_search_query(q)
+                    if not self._llm_query_relevant(normalized_query, spec.requirement, phenomenon):
                         continue
-                    queries.append(q.strip())
+                    compact_query = re.sub(r"[^a-z0-9]", "", normalized_query)
+                    duplicate = any(
+                        re.sub(r"[^a-z0-9]", "", self._normalize_search_query(existing))
+                        == compact_query
+                        for existing in queries
+                    ) or any(
+                        re.sub(r"[^a-z0-9]", "", self._normalize_search_query(existing.query))
+                        == compact_query
+                        for existing in plan.search_queries
+                    )
+                    if duplicate:
+                        continue
+                    queries.append(re.sub(r"\s+", " ", q.strip()))
                 queries = queries[:3]
             reasoning = (
                 raw_reasoning.strip()
@@ -385,7 +547,7 @@ class PlanningAgent:
                 else None
             )
             if not queries and not reasoning:
-                raise ValueError("planner response had no usable suggestions")
+                raise LLMResponseError("planner response had no usable suggestions")
             if reasoning:
                 plan.reasoning = reasoning
             added = 0
@@ -432,7 +594,7 @@ class PlanningAgent:
                 added += 1
                 if added >= 3:
                     break
-        except Exception as exc:
+        except LLMError as exc:
             logger.warning("Planner LLM refinement unavailable; using rules: %s", exc)
             plan.reasoning = fallback_reasoning
             self._warn_once(spec, "LLM unavailable, planner used rules only")
@@ -690,18 +852,9 @@ class PlanningAgent:
             self._llm_refinement(plan, spec, use_llm=use_llm)
             spec.plan = plan
             spec.current_stage = "planning"
-        except Exception:
-            logger.exception("Planning failed; returning a minimal plan for supported requirement")
-            self._warn_once(spec, "Planner failed; a minimal rules-only plan was created.")
-            spec.plan = PlanSpec(
-                reasoning=self._rule_reasoning(spec),
-                uncovered_features=(
-                    list(dict.fromkeys(spec.requirement.expected_features))
-                    if spec.requirement else []
-                ),
-                confidence=0.0,
-            )
-            spec.current_stage = "planning"
+        except (ArithmeticError, KeyError, TypeError, ValueError, AttributeError):
+            logger.exception("Unexpected programming or source-matching error while planning")
+            raise
 
         print(
             f"✅ Planning complete: {len(spec.plan.source_requirements)} source type(s), "

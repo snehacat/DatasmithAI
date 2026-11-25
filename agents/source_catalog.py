@@ -17,12 +17,20 @@ def normalize_feature_name(name: str) -> str:
     >>> normalize_feature_name("timestamp") == "time"
     >>> normalize_feature_name("river discharge") == "streamflow"
     >>> normalize_feature_name("river level") == "waterlevel"
+    >>> normalize_feature_name("rainfall") == "precipitation"
+    >>> normalize_feature_name("ozone") == "ozone"
+    >>> normalize_feature_name("O3") == "ozone"
     """
     compact = re.sub(r"[\s_\-\.]", "", name.lower())
     aliases = {
         "timestamp": "time",
         "riverdischarge": "streamflow",
         "riverlevel": "waterlevel",
+        "waterlevel": "waterlevel",
+        "rainfall": "precipitation",
+        "precipitation": "precipitation",
+        "ozone": "ozone",
+        "o3": "ozone",
     }
     return aliases.get(compact, compact)
 
@@ -107,7 +115,7 @@ SOURCE_CATALOG = [
         "OpenAQ streams station readings in near-real-time and also archives history. "
         "A free API key is sufficient; no paid tier is required for basic access. "
         "Verify station density and rate limits before use.",
-        connector_available=True, data_origin="measured",
+        connector_available=False, data_origin="measured",
     ),
     SourceCatalogEntry(
         "cpcb_namp_air_quality", "CPCB NAMP",
@@ -127,7 +135,7 @@ SOURCE_CATALOG = [
         "Completely free, no API key required. Provides hourly air-quality forecasts "
         "and recent historical values via a simple REST endpoint. "
         "Verify before use: coverage and variables may change between API versions.",
-        connector_available=True, data_origin="modeled",
+        connector_available=False, data_origin="modeled",
     ),
     SourceCatalogEntry(
         "usgs_earthquake_catalog", "USGS Earthquake Catalog",

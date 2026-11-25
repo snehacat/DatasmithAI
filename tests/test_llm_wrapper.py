@@ -2,11 +2,24 @@
 Tests for LLM Wrapper
 """
 
-import pytest
+import json
 import logging
+
 import httpx
+import ollama
+import pytest
 from pydantic import BaseModel
-from core.llm_wrapper import LLMWrapper, LLMConfig, get_llm, reset_llm
+from pydantic import ValidationError
+from core.llm_wrapper import (
+    LLMConnectionError,
+    LLMConfig,
+    LLMError,
+    LLMResponseError,
+    LLMTimeoutError,
+    LLMWrapper,
+    get_llm,
+    reset_llm,
+)
 
 
 class SampleSchema(BaseModel):
@@ -58,7 +71,7 @@ def test_schema_validation():
     llm = LLMWrapper()
 
     # Missing 'name' field: fails validation on every attempt, so the wrapper raises
-    with pytest.raises(RuntimeError, match="validation"):
+    with pytest.raises(LLMResponseError, match="validation"):
         llm.call(
             prompt='Return JSON: {"value": 42, "success": true}',
             expected_schema=SampleSchema
@@ -103,7 +116,7 @@ def test_invalid_json_handling():
     
     # Force non-JSON mode and ask for invalid JSON
        # Invalid JSON fails parsing on every attempt, so the wrapper raises
-    with pytest.raises(RuntimeError, match="JSON"):
+    with pytest.raises(LLMResponseError, match="JSON"):
         llm.call(
             prompt='Return invalid JSON: {name: test, value: invalid}',
             force_json=False  # Don't force JSON format
@@ -161,7 +174,7 @@ def make_llm(replies):
 
 def test_non_object_json_is_rejected_with_clear_error():
     llm = make_llm(['[1, 2, 3]', '[1, 2, 3]'])
-    with pytest.raises(RuntimeError, match="expected a JSON object, got list"):
+    with pytest.raises(LLMResponseError, match="expected a JSON object, got list"):
         llm.call("give me json")
     assert len(llm.client.prompts) == 2   # it retried once
 
@@ -235,19 +248,131 @@ def test_httpx_connect_error_is_reported_as_connection_failure():
 
     llm = LLMWrapper()
     llm.client = Spy()
-    with pytest.raises(RuntimeError, match="Cannot connect to Ollama"):
+    with pytest.raises(LLMConnectionError, match="Cannot connect to Ollama") as caught:
         llm.call("hello")
+    assert isinstance(caught.value.__cause__, httpx.ConnectError)
+
+
+def test_httpx_request_timeout_uses_timeout_error_and_preserves_cause():
+    timeout = httpx.ReadTimeout("request timed out")
+
+    class Spy:
+        def chat(self, **kwargs):
+            raise timeout
+
+    llm = LLMWrapper()
+    llm.client = Spy()
+    with pytest.raises(LLMTimeoutError) as caught:
+        llm.call("hello")
+
+    assert isinstance(caught.value, TimeoutError)
+    assert caught.value.__cause__ is timeout
+
+
+def test_malformed_json_uses_response_error_and_preserves_cause():
+    llm = make_llm(["not json", "still not json"])
+    with pytest.raises(LLMResponseError) as caught:
+        llm.call("give me json")
+
+    assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        json.JSONDecodeError("invalid response JSON", "{", 0),
+        httpx.DecodingError("invalid response encoding"),
+    ],
+)
+def test_client_response_decoding_errors_use_response_error(error):
+    class Spy:
+        def chat(self, **kwargs):
+            raise error
+
+    llm = LLMWrapper()
+    llm.client = Spy()
+    with pytest.raises(LLMResponseError) as caught:
+        llm.call("hello")
+
+    assert caught.value.__cause__ is error
+
+
+def test_client_response_validation_error_uses_response_error():
+    with pytest.raises(ValidationError) as validation:
+        SampleSchema.model_validate({})
+    error = validation.value
+
+    class Spy:
+        def chat(self, **kwargs):
+            raise error
+
+    llm = LLMWrapper()
+    llm.client = Spy()
+    with pytest.raises(LLMResponseError) as caught:
+        llm.call("hello")
+
+    assert caught.value.__cause__ is error
+
+
+def test_total_timeout_uses_custom_timeout_error():
+    llm = LLMWrapper(LLMConfig(total_timeout_seconds=0))
+
+    with pytest.raises(LLMTimeoutError) as caught:
+        llm.call("hello")
+
+    assert caught.value.__cause__ is None
+
+
+def test_schema_validation_exhaustion_uses_response_error_and_preserves_cause():
+    llm = make_llm(['{"value": 42, "success": true}'] * 2)
+
+    with pytest.raises(LLMResponseError) as caught:
+        llm.call("give me json", expected_schema=SampleSchema)
+
+    assert isinstance(caught.value.__cause__, ValidationError)
+
+
+def test_invalid_response_structure_uses_response_error_and_preserves_cause():
+    class Spy:
+        def chat(self, **kwargs):
+            return {"message": {}}
+
+    llm = LLMWrapper()
+    llm.client = Spy()
+    with pytest.raises(LLMResponseError) as caught:
+        llm.call("hello")
+
+    assert isinstance(caught.value.__cause__, KeyError)
+
+
+@pytest.mark.parametrize("error", [
+    TypeError("unexpected type bug"),
+    KeyError("unexpected key bug"),
+    RuntimeError("unrelated runtime bug"),
+])
+def test_unexpected_client_errors_are_not_reclassified(error):
+    class Spy:
+        def chat(self, **kwargs):
+            raise error
+
+    llm = LLMWrapper()
+    llm.client = Spy()
+    with pytest.raises(type(error)) as caught:
+        llm.call("hello")
+
+    assert caught.value is error
 
 
 def test_model_not_found_has_pull_command():
     class Spy:
         def chat(self, **kwargs):
-            raise RuntimeError("model 'missing-model' not found")
+            raise ollama.ResponseError("model 'missing-model' not found", status_code=404)
 
     llm = LLMWrapper(LLMConfig(model_name="missing-model"))
     llm.client = Spy()
-    with pytest.raises(RuntimeError, match=r"Run: ollama pull missing-model"):
+    with pytest.raises(LLMError, match=r"Run: ollama pull missing-model") as caught:
         llm.call("hello")
+    assert isinstance(caught.value.__cause__, ollama.ResponseError)
 
 if __name__ == "__main__":
     # Run tests
