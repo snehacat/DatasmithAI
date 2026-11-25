@@ -17,6 +17,10 @@ from core.dataset_spec import (
     DownloadedArtifact,
     FailedSource,
     RetrievalSpec,
+    EvaluationRequirements,
+    ApplicationPlanningPolicy,
+    UsageIntent,
+    derive_evaluation_requirements,
     validate_spec,
     create_initial_spec
 )
@@ -88,6 +92,7 @@ def test_requirement_spec_defaults():
     # Check defaults
     assert req.freshness_need == "unspecified"
     assert req.max_data_age is None
+    assert req.requested_update_frequency is None
     assert req.geography is None
     assert req.time_range is None
     assert req.output_format == "csv"
@@ -508,6 +513,287 @@ def test_dataset_spec_rejects_unmappable_legacy_failed_sources(legacy_failure):
 
     with pytest.raises(ValidationError, match=r"failed_sources\[0\] cannot be migrated safely"):
         DatasetSpec.model_validate(payload)
+
+
+def test_usage_intent_requires_use_and_defaults_to_only_use():
+    assert UsageIntent().required_rights == ["use"]
+    assert UsageIntent(required_rights=["use", "commercial_use"]).required_rights == [
+        "use", "commercial_use"
+    ]
+
+    with pytest.raises(ValidationError, match="must always require the 'use' right"):
+        UsageIntent(required_rights=["modify"])
+
+    with pytest.raises(ValidationError, match="must be unique"):
+        UsageIntent(required_rights=["use", "use"])
+
+
+def test_evaluation_requirements_validate_classification_and_dimensions():
+    requirements = EvaluationRequirements(
+        policy_version="1",
+        required_dimensions=["purpose", "variables"],
+        dimension_criticality={"purpose": "essential", "variables": "essential"},
+        required_variables=["PM2.5"],
+    )
+
+    assert requirements.dimension_criticality["purpose"] == "essential"
+
+    with pytest.raises(ValidationError, match="required_dimensions must be unique"):
+        EvaluationRequirements(
+            policy_version="1",
+            required_dimensions=["purpose", "purpose"],
+            dimension_criticality={"purpose": "essential"},
+        )
+
+    with pytest.raises(ValidationError, match="classify every required dimension"):
+        EvaluationRequirements(
+            policy_version="1",
+            required_dimensions=["purpose", "access"],
+            dimension_criticality={"purpose": "essential"},
+        )
+
+
+@pytest.mark.parametrize(
+    "field,values",
+    [
+        ("required_variables", ["PM2.5", "PM 2.5"]),
+        ("required_formats", ["CSV", "text/csv"]),
+        ("required_retrieval_methods", ["direct_download", "direct_download"]),
+    ],
+)
+def test_evaluation_requirements_reject_duplicate_constraints(field, values):
+    kwargs = {
+        "policy_version": "1",
+        "required_dimensions": ["purpose"],
+        "dimension_criticality": {"purpose": "essential"},
+        field: values,
+    }
+
+    with pytest.raises(ValidationError):
+        EvaluationRequirements(**kwargs)
+
+
+def test_evaluation_requirements_require_dimension_for_constraints():
+    with pytest.raises(ValidationError, match="requires 'variables'"):
+        EvaluationRequirements(
+            policy_version="1",
+            required_dimensions=["purpose"],
+            dimension_criticality={"purpose": "essential"},
+            required_variables=["temperature"],
+        )
+
+
+def test_derive_evaluation_requirements_uses_structured_request_fields():
+    requirement = RequirementSpec(
+        dataset_name="Weather",
+        description="Hourly city weather",
+        expected_features=["temperature", "humidity", "Temperature"],
+        target_variable="heat_index",
+        target_requires_derivation=True,
+        geography="Delhi",
+        time_range="2020-2025",
+        time_granularity="hourly",
+        freshness_need="recent",
+        output_format="excel",
+    )
+
+    policy = derive_evaluation_requirements(
+        requirement,
+        UsageIntent(required_rights=["use", "modify"]),
+        required_formats=["text/csv"],
+        required_retrieval_methods=["http_api"],
+    )
+
+    assert isinstance(policy, ApplicationPlanningPolicy)
+    assert policy.usage_intent.required_rights == ["use", "modify"]
+    requirements = policy.evaluation_requirements
+    assert requirements.required_variables == ["temperature", "humidity"]
+    assert requirements.required_formats == ["text/csv"]
+    assert requirements.required_retrieval_methods == ["http_api"]
+    assert "geography" in requirements.required_dimensions
+    assert "temporal_coverage" in requirements.required_dimensions
+    assert "resolution" in requirements.required_dimensions
+    assert requirements.dimension_criticality["publisher_reliability"] == "advisory"
+    assert "excel" not in requirements.required_formats
+    restored = ApplicationPlanningPolicy.model_validate(policy.model_dump())
+    assert restored.evaluation_requirements == requirements
+    assert restored.usage_intent.required_rights == ["use", "modify"]
+
+
+def test_derive_evaluation_requirements_accepts_usage_intent_model():
+    usage_intent = UsageIntent(required_rights=["use", "redistribute"])
+    requirement = RequirementSpec(dataset_name="Data", description="Data request")
+
+    policy = derive_evaluation_requirements(requirement, usage_intent)
+
+    assert policy.usage_intent == usage_intent
+
+
+@pytest.mark.parametrize("usage_intent", [None, "use", 42, ["use"]])
+def test_derive_evaluation_requirements_rejects_invalid_usage_intent_types(usage_intent):
+    requirement = RequirementSpec(dataset_name="Data", description="Data request")
+
+    with pytest.raises(ValidationError, match="UsageIntent"):
+        derive_evaluation_requirements(requirement, usage_intent)
+
+
+def test_schema_variable_identity_does_not_apply_catalog_aliases():
+    from agents.source_catalog import normalize_feature_name
+
+    requirements = EvaluationRequirements(
+        policy_version="1",
+        required_dimensions=["variables"],
+        dimension_criticality={"variables": "essential"},
+        required_variables=["timestamp", "time"],
+    )
+
+    assert requirements.required_variables == ["timestamp", "time"]
+    assert normalize_feature_name("timestamp") == normalize_feature_name("time")
+
+
+@pytest.mark.parametrize(
+    "freshness_need,max_data_age,requested_update_frequency,expected",
+    [
+        ("live", None, None, {"freshness", "update_frequency"}),
+        ("recent", None, None, {"freshness", "update_frequency"}),
+        ("historical", None, None, {"temporal_coverage"}),
+        ("unspecified", None, None, set()),
+        ("historical", "24 hours", None, {"temporal_coverage", "freshness"}),
+        ("unspecified", "24 hours", None, {"freshness"}),
+        ("unspecified", None, "daily", {"update_frequency"}),
+    ],
+)
+def test_freshness_and_update_frequency_policy(freshness_need, max_data_age,
+                                              requested_update_frequency, expected):
+    requirement = RequirementSpec(
+        dataset_name="Data",
+        description="Data request",
+        freshness_need=freshness_need,
+        max_data_age=max_data_age,
+        requested_update_frequency=requested_update_frequency,
+    )
+
+    policy = derive_evaluation_requirements(requirement, UsageIntent())
+    actual = set(policy.evaluation_requirements.required_dimensions)
+    freshness_dimensions = {"freshness", "update_frequency", "temporal_coverage"}
+    assert actual & freshness_dimensions == expected
+
+
+def test_max_data_age_hours_alone_marks_freshness_essential():
+    """Regression: max_data_age_hours populated while max_data_age is None must
+    still mark freshness as essential.  Previously the condition only checked
+    max_data_age (the string field), so a requirement with only max_data_age_hours
+    set would silently produce a policy without a freshness dimension."""
+    requirement = RequirementSpec(
+        dataset_name="Data",
+        description="Data request",
+        freshness_need="unspecified",
+        max_data_age=None,           # string field deliberately absent
+        max_data_age_hours=24,       # only the integer field is set
+    )
+
+    policy = derive_evaluation_requirements(requirement, UsageIntent())
+    assert "freshness" in policy.evaluation_requirements.required_dimensions, (
+        "freshness must be essential when max_data_age_hours is set, "
+        "even if max_data_age is None"
+    )
+    assert (
+        policy.evaluation_requirements.dimension_criticality["freshness"] == "essential"
+    )
+
+
+def test_requested_update_frequency_rejects_blank_value():
+    with pytest.raises(ValidationError, match="requested_update_frequency must not be blank"):
+        RequirementSpec(
+            dataset_name="Data",
+            description="Data request",
+            requested_update_frequency=" \t ",
+        )
+
+
+@pytest.mark.parametrize("policy_version", ["", " ", "\t\n"])
+def test_evaluation_requirements_rejects_blank_policy_version(policy_version):
+    with pytest.raises(ValidationError, match="policy_version must not be blank"):
+        EvaluationRequirements(
+            policy_version=policy_version,
+            required_dimensions=["purpose"],
+            dimension_criticality={"purpose": "essential"},
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("required_variables", ["   "]),
+        ("required_variables", ["\x00"]),
+        ("required_variables", ["---"]),
+        ("required_variables", [42]),
+        ("required_variables", [None]),
+        ("required_formats", [""]),
+        ("required_formats", ["text/"]),
+        ("required_formats", ["/csv"]),
+        ("required_formats", ["text/csv; charset"]),
+        ("required_formats", ['text/csv; charset="utf-8']),
+        ("required_formats", ["text / csv"]),
+        ("required_formats", [42]),
+        ("required_formats", [None]),
+    ],
+)
+def test_evaluation_requirements_rejects_invalid_identifiers(field, value):
+    kwargs = {
+        "policy_version": "1",
+        "required_dimensions": ["variables", "formats"],
+        "dimension_criticality": {
+            "variables": "essential",
+            "formats": "essential",
+        },
+        field: value,
+    }
+
+    with pytest.raises(ValidationError):
+        EvaluationRequirements(**kwargs)
+
+
+def test_evaluation_requirements_rejects_non_string_policy_version():
+    with pytest.raises(ValidationError):
+        EvaluationRequirements(
+            policy_version=1,
+            required_dimensions=["purpose"],
+            dimension_criticality={"purpose": "essential"},
+        )
+
+
+def test_mime_parameters_are_syntax_checked_but_ignored_for_format_identity():
+    requirements = EvaluationRequirements(
+        policy_version="1",
+        required_dimensions=["formats"],
+        dimension_criticality={"formats": "essential"},
+        required_formats=['application/json; PrOfIlE="https://example.test/a;b"'],
+    )
+    assert requirements.required_formats == [
+        'application/json; PrOfIlE="https://example.test/a;b"'
+    ]
+
+    with pytest.raises(ValidationError, match="unique after normalization"):
+        EvaluationRequirements(
+            policy_version="1",
+            required_dimensions=["formats"],
+            dimension_criticality={"formats": "essential"},
+            required_formats=[
+                'text/csv; charset="utf-8"',
+                "TEXT/CSV; CHARSET=UTF-8",
+            ],
+        )
+
+    # Syntax is checked, but MIME parameter semantics are deliberately not
+    # verified by this planning-policy model.
+    accepted = EvaluationRequirements(
+        policy_version="1",
+        required_dimensions=["formats"],
+        dimension_criticality={"formats": "essential"},
+        required_formats=['text/csv; charset="not-a-validated-charset"'],
+    )
+    assert accepted.required_formats
 
 
 if __name__ == "__main__":

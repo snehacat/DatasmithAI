@@ -6,11 +6,15 @@ import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from core.dataset_spec import (
+    ApplicationPlanningPolicy,
+    CandidateSource,
     DatasetSpec,
     PlanSpec,
     RequirementSpec,
     SearchQuery,
     SourceRequirement,
+    UsageIntent,
+    derive_evaluation_requirements,
 )
 from core.llm_wrapper import LLMError, LLMResponseError, get_llm
 
@@ -632,7 +636,12 @@ class PlanningAgent:
 
         return "; ".join(parts) + "."
 
-    def plan(self, spec: DatasetSpec, use_llm: bool = True) -> DatasetSpec:
+    def plan(
+        self,
+        spec: DatasetSpec,
+        use_llm: bool = True,
+        policy: Optional[ApplicationPlanningPolicy] = None,
+    ) -> DatasetSpec:
         """Create or replace the data-source plan for ``spec.requirement``.
 
         Parameters
@@ -642,12 +651,105 @@ class PlanningAgent:
         use_llm:
             When ``True`` (default) the LLM may add extra queries; when ``False``
             or when rule-built queries already number >= 4, the LLM call is skipped.
+        policy:
+            Application-owned evaluation policy derived from the actual requirement.
+            If ``None``, the planner derives policy internally from ``spec.requirement``
+            using ``derive_evaluation_requirements()``.  The LLM never authors or
+            modifies this policy regardless of how it is supplied.
         """
         self._reset_stats()
         if spec.requirement is None:
             raise ValueError("spec.requirement must be set with dataset_name and description")
         if not spec.requirement.is_supported:
             return spec
+
+        # Derive the expected evaluation requirements from the actual requirement.
+        # This is the ground truth; it must happen before any LLM interaction.
+        try:
+            derived_policy = derive_evaluation_requirements(
+                spec.requirement,
+                UsageIntent(),
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Failed to derive evaluation policy from requirement: {exc}"
+            ) from exc
+
+        if policy is not None:
+            # A caller-supplied policy is accepted only when its evaluation
+            # requirements exactly match the derived requirements.  The
+            # UsageIntent may differ (e.g., the caller adds "redistribute").
+            # Reject before any LLM interaction so errors are surfaced early.
+            supplied = policy.evaluation_requirements
+            expected = derived_policy.evaluation_requirements
+
+            # Compare every aspect of the evaluation requirements that affects
+            # which dimensions are investigated and how they are prioritised.
+            mismatches: List[str] = []
+
+            supplied_dims = set(supplied.required_dimensions)
+            expected_dims = set(expected.required_dimensions)
+            missing = expected_dims - supplied_dims
+            extra   = supplied_dims - expected_dims
+            if missing:
+                mismatches.append(
+                    f"supplied policy is missing required dimensions: {sorted(missing)}"
+                )
+            if extra:
+                mismatches.append(
+                    f"supplied policy has unexpected dimensions: {sorted(extra)}"
+                )
+
+            # Criticality must match for every shared dimension.
+            for dim in supplied_dims & expected_dims:
+                s_crit = supplied.dimension_criticality.get(dim)
+                e_crit = expected.dimension_criticality.get(dim)
+                if s_crit != e_crit:
+                    mismatches.append(
+                        f"dimension '{dim}' has criticality {s_crit!r} in supplied "
+                        f"policy but {e_crit!r} is required"
+                    )
+
+            # Required variables, formats, and retrieval methods must match.
+            def _norm_list(values: List[str]) -> List[str]:
+                return sorted(v.strip().lower() for v in values)
+
+            if _norm_list(supplied.required_variables) != _norm_list(expected.required_variables):
+                mismatches.append(
+                    f"required_variables mismatch: supplied {supplied.required_variables!r}, "
+                    f"expected {expected.required_variables!r}"
+                )
+            if _norm_list(supplied.required_formats) != _norm_list(expected.required_formats):
+                mismatches.append(
+                    f"required_formats mismatch: supplied {supplied.required_formats!r}, "
+                    f"expected {expected.required_formats!r}"
+                )
+            if sorted(supplied.required_retrieval_methods) != sorted(
+                expected.required_retrieval_methods
+            ):
+                mismatches.append(
+                    f"required_retrieval_methods mismatch: "
+                    f"supplied {supplied.required_retrieval_methods!r}, "
+                    f"expected {expected.required_retrieval_methods!r}"
+                )
+            if supplied.policy_version != expected.policy_version:
+                mismatches.append(
+                    f"policy_version mismatch: supplied {supplied.policy_version!r}, "
+                    f"expected {expected.policy_version!r}"
+                )
+
+            if mismatches:
+                detail = "; ".join(mismatches)
+                raise ValueError(
+                    f"Supplied policy is inconsistent with the actual requirement "
+                    f"({detail}). Derive the policy from the requirement using "
+                    f"derive_evaluation_requirements() before passing it to the planner."
+                )
+
+            # Evaluation requirements are consistent; preserve the caller's UsageIntent.
+            effective_policy: ApplicationPlanningPolicy = policy
+        else:
+            effective_policy = derived_policy
 
         try:
             requirement = spec.requirement
@@ -672,6 +774,7 @@ class PlanningAgent:
                     uncovered_features=list(dict.fromkeys(requirement.expected_features)),
                     reasoning=self._rule_reasoning(spec),
                     confidence=0.0,
+                    planning_policy=effective_policy,
                 )
                 if requirement.expected_features:
                     self._warn_once(
@@ -845,6 +948,7 @@ class PlanningAgent:
                 fallback_source_types=fallback,
                 reasoning=self._rule_reasoning(spec),
                 confidence=round(max(0.0, min(1.0, confidence)), 2),
+                planning_policy=effective_policy,
             )
             # Assign plan first so _rule_reasoning can count sources from spec.plan
             spec.plan = plan

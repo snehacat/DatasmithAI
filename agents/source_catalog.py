@@ -1,38 +1,9 @@
 """Static provider hints for planning; verify capabilities and access before use."""
 
-import re
 from dataclasses import dataclass
 from typing import List
 
-
-def normalize_feature_name(name: str) -> str:
-    """Canonicalize spelling and explicitly supported feature aliases.
-
-    Examples
-    --------
-    >>> normalize_feature_name("PM2.5")   == "pm25"
-    >>> normalize_feature_name("pm2_5")   == "pm25"
-    >>> normalize_feature_name("PM 2.5")  == "pm25"
-    >>> normalize_feature_name("no2")     == "no2"
-    >>> normalize_feature_name("timestamp") == "time"
-    >>> normalize_feature_name("river discharge") == "streamflow"
-    >>> normalize_feature_name("river level") == "waterlevel"
-    >>> normalize_feature_name("rainfall") == "precipitation"
-    >>> normalize_feature_name("ozone") == "ozone"
-    >>> normalize_feature_name("O3") == "ozone"
-    """
-    compact = re.sub(r"[\s_\-\.]", "", name.lower())
-    aliases = {
-        "timestamp": "time",
-        "riverdischarge": "streamflow",
-        "riverlevel": "waterlevel",
-        "waterlevel": "waterlevel",
-        "rainfall": "precipitation",
-        "precipitation": "precipitation",
-        "ozone": "ozone",
-        "o3": "ozone",
-    }
-    return aliases.get(compact, compact)
+from core.feature_names import normalize_feature_name
 
 
 @dataclass(frozen=True)
