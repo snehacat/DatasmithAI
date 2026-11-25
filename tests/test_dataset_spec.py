@@ -2,6 +2,8 @@
 Tests for Dataset Specification (Data Contract)
 """
 
+import json
+
 import pytest
 from pydantic import ValidationError
 from core.dataset_spec import (
@@ -12,6 +14,9 @@ from core.dataset_spec import (
     AgentStatus,
     AgentExecution,
     DataRecord,
+    DownloadedArtifact,
+    FailedSource,
+    RetrievalSpec,
     validate_spec,
     create_initial_spec
 )
@@ -258,6 +263,251 @@ def test_invalid_assignment_is_rejected():
     assert r.output_format == "csv"    # the bad value was not stored
     r.output_format = "json"           # a valid value still works
     assert r.output_format == "json"
+
+
+def test_downloaded_artifact_validation():
+    artifact = DownloadedArtifact(
+        relative_path="weather/daily.csv",
+        sha256="a" * 64,
+        bytes=128,
+        content_type="text/csv",
+        source_url="https://example.test/weather.csv",
+        retrieved_at="2026-10-07T12:30:00Z",
+        extraction_method="direct_download",
+        row_count=4,
+        license="CC-BY-4.0",
+    )
+
+    assert artifact.relative_path == "weather/daily.csv"
+    assert artifact.bytes == 128
+    assert artifact.row_count == 4
+    assert artifact.license == "CC-BY-4.0"
+
+
+def test_downloaded_artifact_accepts_nested_relative_path():
+    artifact = DownloadedArtifact(
+        relative_path="raw/weather/2026/daily.csv",
+        sha256="a" * 64,
+        bytes=128,
+        source_url="https://example.test/weather.csv",
+        retrieved_at="2026-10-07T12:30:00Z",
+        extraction_method="direct_download",
+    )
+
+    assert artifact.relative_path == "raw/weather/2026/daily.csv"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"relative_path": "../outside.csv"},
+        {"relative_path": "raw/../../outside.csv"},
+        {"relative_path": "/absolute/path.csv"},
+        {"relative_path": "C:\\outside.csv"},
+        {"relative_path": "bad\x00path.csv"},
+        {"sha256": "not-a-checksum"},
+        {"bytes": -1},
+        {"row_count": -1},
+        {"retrieved_at": "not-a-timestamp"},
+    ],
+)
+def test_downloaded_artifact_rejects_invalid_values(overrides):
+    values = {
+        "relative_path": "data.csv",
+        "sha256": "a" * 64,
+        "bytes": 0,
+        "source_url": "https://example.test/data.csv",
+        "retrieved_at": "2026-10-07T12:30:00Z",
+        "extraction_method": "direct_download",
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValidationError):
+        DownloadedArtifact(**values)
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["relative_path", "sha256", "bytes", "source_url", "retrieved_at", "extraction_method"],
+)
+def test_downloaded_artifact_requires_metadata(missing_field):
+    values = {
+        "relative_path": "raw/data.csv",
+        "sha256": "a" * 64,
+        "bytes": 128,
+        "source_url": "https://example.test/data.csv",
+        "retrieved_at": "2026-10-07T12:30:00Z",
+        "extraction_method": "direct_download",
+    }
+    values.pop(missing_field)
+
+    with pytest.raises(ValidationError):
+        DownloadedArtifact(**values)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("relative_path", ""),
+        ("sha256", ""),
+        ("source_url", ""),
+        ("extraction_method", ""),
+    ],
+)
+def test_downloaded_artifact_rejects_empty_required_strings(field, value):
+    values = {
+        "relative_path": "raw/data.csv",
+        "sha256": "a" * 64,
+        "bytes": 128,
+        "source_url": "https://example.test/data.csv",
+        "retrieved_at": "2026-10-07T12:30:00Z",
+        "extraction_method": "direct_download",
+    }
+    values[field] = value
+
+    with pytest.raises(ValidationError):
+        DownloadedArtifact(**values)
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    ["timeout", "too_large", "bad_content_type", "auth_required", "parse_error"],
+)
+def test_failed_source_accepts_supported_reason_codes(reason_code):
+    failed_source = FailedSource(
+        source_url="https://example.test/data.csv",
+        source_title="Example data",
+        reason_code=reason_code,
+        error_message="Retrieval failed",
+        retrieved_at="2026-10-07T12:30:00Z",
+    )
+
+    assert failed_source.reason_code == reason_code
+
+
+def test_failed_source_rejects_unsupported_reason_code():
+    with pytest.raises(ValidationError):
+        FailedSource(
+            source_url="https://example.test/data.csv",
+            reason_code="not_a_reason",
+            error_message="Retrieval failed",
+            retrieved_at="2026-10-07T12:30:00Z",
+        )
+
+
+@pytest.mark.parametrize("missing_field", ["reason_code", "error_message", "retrieved_at"])
+def test_failed_source_requires_metadata(missing_field):
+    values = {
+        "source_url": "https://example.test/data.csv",
+        "source_title": "Example data",
+        "reason_code": "timeout",
+        "error_message": "Request timed out",
+        "retrieved_at": "2026-10-07T12:30:00Z",
+    }
+    values.pop(missing_field)
+
+    with pytest.raises(ValidationError):
+        FailedSource(**values)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("error_message", ""),
+        ("reason_code", ""),
+        ("retrieved_at", ""),
+    ],
+)
+def test_failed_source_rejects_empty_required_values(field, value):
+    values = {
+        "source_url": "https://example.test/data.csv",
+        "reason_code": "timeout",
+        "error_message": "Request timed out",
+        "retrieved_at": "2026-10-07T12:30:00Z",
+    }
+    values[field] = value
+
+    with pytest.raises(ValidationError):
+        FailedSource(**values)
+
+
+def test_retrieval_spec_serializes_and_deserializes_artifacts_and_failures():
+    retrieval = RetrievalSpec(
+        downloaded_artifacts=[
+            DownloadedArtifact(
+                relative_path="raw/data.json",
+                sha256="b" * 64,
+                bytes=64,
+                source_url="https://example.test/data.json",
+                retrieved_at="2026-10-07T12:30:00Z",
+                extraction_method="direct_download",
+            )
+        ],
+        failed_sources=[
+            FailedSource(
+                source_url="https://example.test/other.csv",
+                source_title="Other data",
+                reason_code="timeout",
+                error_message="Request timed out",
+                retrieved_at="2026-10-07T12:31:00Z",
+            )
+        ],
+    )
+
+    serialized = retrieval.model_dump(mode="json")
+    restored = RetrievalSpec.model_validate(serialized)
+
+    assert restored.downloaded_artifacts[0].relative_path == "raw/data.json"
+    assert restored.downloaded_artifacts[0].retrieved_at.isoformat() == "2026-10-07T12:30:00+00:00"
+    assert restored.failed_sources[0].reason_code == "timeout"
+    assert restored.raw_records == []
+
+
+def test_dataset_spec_migrates_compatible_legacy_failed_sources():
+    legacy_failure = {
+        "source_url": "https://example.test/data.csv",
+        "source_title": "Example data",
+        "reason_code": "timeout",
+        "error_message": "Request timed out",
+        "retrieved_at": "2026-10-07T12:30:00Z",
+    }
+    payload = create_initial_spec("Dataset", "Description").model_dump(mode="json")
+    payload["retrieval"] = {"failed_sources": [legacy_failure]}
+
+    restored = DatasetSpec.model_validate_json(json.dumps(payload))
+
+    assert isinstance(restored.retrieval.failed_sources[0], FailedSource)
+    assert restored.retrieval.failed_sources[0].reason_code == "timeout"
+    assert restored.model_dump(mode="json")["retrieval"]["failed_sources"] == [legacy_failure]
+
+
+@pytest.mark.parametrize(
+    "legacy_failure",
+    [
+        {
+            "source_url": "https://example.test/data.csv",
+            "error_message": "Request timed out",
+            "retrieved_at": "2026-10-07T12:30:00Z",
+        },
+        {
+            "source_url": "https://example.test/data.csv",
+            "reason_code": "timeout",
+            "error_message": "Request timed out",
+        },
+        {
+            "reason_code": "timeout",
+            "error_message": "Request timed out",
+            "retrieved_at": "2026-10-07T12:30:00Z",
+            "legacy_payload": {"detail": "must not be discarded"},
+        },
+    ],
+)
+def test_dataset_spec_rejects_unmappable_legacy_failed_sources(legacy_failure):
+    payload = create_initial_spec("Dataset", "Description").model_dump(mode="json")
+    payload["retrieval"] = {"failed_sources": [legacy_failure]}
+
+    with pytest.raises(ValidationError, match=r"failed_sources\[0\] cannot be migrated safely"):
+        DatasetSpec.model_validate(payload)
 
 
 if __name__ == "__main__":

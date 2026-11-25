@@ -5,8 +5,10 @@ Universal data contract that ALL agents read and write.
 Grows through the pipeline, with each agent adding its section.
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 import uuid
+import re
+from pathlib import PurePosixPath
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
 from enum import Enum
@@ -229,15 +231,72 @@ class DataRecord(SpecModel):
     source_type: str = Field(..., description="Source type")
 
 
+class DownloadedArtifact(SpecModel):
+    """Metadata for a downloaded file stored under a run's raw artifact directory."""
+
+    relative_path: str = Field(
+        ...,
+        min_length=1,
+        description="Path relative to the run's artifact directory",
+    )
+    sha256: str = Field(..., pattern=r"^[a-fA-F0-9]{64}$")
+    bytes: int = Field(..., ge=0, description="Downloaded file size in bytes")
+    content_type: Optional[str] = Field(None, description="MIME content type, when known")
+    source_url: str = Field(..., min_length=1, description="Original source URL")
+    retrieved_at: datetime = Field(..., description="Retrieval timestamp")
+    extraction_method: str = Field(..., min_length=1, description="How the file was obtained")
+    row_count: Optional[int] = Field(None, ge=0, description="Parsed row count, when available")
+    license: Optional[str] = Field(None, description="License information, when known")
+
+    @field_validator("relative_path")
+    @classmethod
+    def validate_relative_path(cls, value: str) -> str:
+        normalized = value.replace("\\", "/")
+        path = PurePosixPath(normalized)
+        if (
+            not normalized
+            or "\x00" in normalized
+            or path.is_absolute()
+            or re.match(r"^[a-zA-Z]:", normalized)
+            or ".." in path.parts
+            or not path.parts
+        ):
+            raise ValueError("relative_path must be a safe relative path")
+        return path.as_posix()
+
+
+class FailedSource(SpecModel):
+    """A source retrieval failure with a constrained machine-readable reason."""
+
+    source_url: Optional[str] = Field(None, min_length=1)
+    source_title: Optional[str] = Field(None, min_length=1)
+    reason_code: Literal[
+        "timeout",
+        "too_large",
+        "bad_content_type",
+        "auth_required",
+        "parse_error",
+    ]
+    error_message: str = Field(..., min_length=1)
+    retrieved_at: datetime = Field(..., description="Retrieval failure timestamp")
+
+
 class RetrievalSpec(SpecModel):
     """Retrieval output - discovered sources and raw data."""
     
     # Sources
     discovered_sources: List[SourceRecord] = Field(default_factory=list, description="All discovered sources")
-    failed_sources: List[Dict[str, Any]] = Field(default_factory=list, description="Sources that failed")
+    failed_sources: List[FailedSource] = Field(default_factory=list, description="Sources that failed")
+    downloaded_artifacts: List[DownloadedArtifact] = Field(
+        default_factory=list,
+        description="Downloaded files stored separately from the JSON specification",
+    )
     
     # Data
-    raw_records: List[DataRecord] = Field(default_factory=list, description="All extracted records")
+    raw_records: List[DataRecord] = Field(
+        default_factory=list,
+        description="Small sample only (maximum 50 rows per source); not the complete dataset",
+    )
     
     # Coverage
     requirements_satisfied: List[str] = Field(default_factory=list, description="Which requirements met")
@@ -247,6 +306,42 @@ class RetrievalSpec(SpecModel):
     # Metadata
     total_sources_discovered: int = Field(0, description="Number of sources found")
     total_records_extracted: int = Field(0, description="Number of records extracted")
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_legacy_failed_sources(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "failed_sources" not in value:
+            return value
+
+        entries = value["failed_sources"]
+        if not isinstance(entries, list):
+            return value
+
+        allowed_fields = set(FailedSource.model_fields)
+        converted_entries = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                converted_entries.append(entry)
+                continue
+
+            unsupported_fields = set(entry) - allowed_fields
+            if unsupported_fields:
+                fields = ", ".join(sorted(unsupported_fields))
+                raise ValueError(
+                    f"failed_sources[{index}] cannot be migrated safely; "
+                    f"unsupported fields: {fields}"
+                )
+
+            try:
+                converted_entries.append(FailedSource.model_validate(entry))
+            except ValidationError as exc:
+                raise ValueError(
+                    f"failed_sources[{index}] cannot be migrated safely: {exc}"
+                ) from exc
+
+        converted_value = dict(value)
+        converted_value["failed_sources"] = converted_entries
+        return converted_value
 
 
 # ============================================================================
