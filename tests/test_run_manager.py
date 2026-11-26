@@ -194,6 +194,324 @@ def test_young_paused_run_is_kept(temp_run_manager):
     assert f"{spec_id}.json" in kept
 
 
+@pytest.mark.parametrize(
+    "spec_id",
+    ["../outside", "DS_../outside", "C:\\outside", "not_a_spec_id", "DS_"],
+)
+def test_raw_artifact_directory_rejects_invalid_spec_ids(temp_run_manager, spec_id):
+    with pytest.raises(ValueError):
+        temp_run_manager.get_raw_artifact_dir(spec_id)
+
+
+def test_raw_artifact_directory_is_created_under_artifacts_root(temp_run_manager):
+    spec_id = "DS_20261007_123000_abcdef"
+
+    raw_dir = temp_run_manager.get_raw_artifact_dir(spec_id)
+
+    assert raw_dir.is_dir()
+    assert raw_dir == temp_run_manager.runs_dir / "artifacts" / spec_id / "raw"
+
+
+def _write_old_rejected_run(run_manager, spec_id):
+    old = datetime.now() - timedelta(days=2)
+    spec = DatasetSpec(
+        spec_id=spec_id,
+        created_at=old.isoformat(),
+        updated_at=old.isoformat(),
+        pipeline_status=PipelineStatus.REJECTED,
+        requirement=RequirementSpec(dataset_name="Rejected", description="old request"),
+    )
+    (run_manager.runs_dir / f"{spec_id}.json").write_text(
+        json.dumps(spec.model_dump(mode="json"), default=str), encoding="utf-8"
+    )
+
+
+def test_pruning_removes_artifacts_for_pruned_run(temp_run_manager):
+    spec_id = "DS_old_with_artifacts"
+    raw_dir = temp_run_manager.get_raw_artifact_dir(spec_id)
+    (raw_dir / "data.csv").write_text("value\n1\n", encoding="utf-8")
+    _write_old_rejected_run(temp_run_manager, spec_id)
+
+    _, deleted = temp_run_manager.prune_runs()
+
+    assert f"{spec_id}.json" in deleted
+    assert not (temp_run_manager.runs_dir / f"artifacts" / spec_id).exists()
+
+
+def test_pruning_preserves_artifacts_for_unpruned_and_unexpected_directories(temp_run_manager):
+    old_spec_id = "DS_old_artifacts"
+    kept_spec_id = "DS_kept_artifacts"
+    old_raw = temp_run_manager.get_raw_artifact_dir(old_spec_id)
+    kept_raw = temp_run_manager.get_raw_artifact_dir(kept_spec_id)
+    (old_raw / "old.csv").write_text("old", encoding="utf-8")
+    (kept_raw / "kept.csv").write_text("kept", encoding="utf-8")
+    _write_old_rejected_run(temp_run_manager, old_spec_id)
+
+    kept_spec = DatasetSpec(
+        spec_id=kept_spec_id,
+        pipeline_status=PipelineStatus.REJECTED,
+        requirement=RequirementSpec(dataset_name="Recent rejection", description="recent"),
+    )
+    (temp_run_manager.runs_dir / f"{kept_spec_id}.json").write_text(
+        json.dumps(kept_spec.model_dump(mode="json"), default=str), encoding="utf-8"
+    )
+
+    unexpected_dir = temp_run_manager.runs_dir / "artifacts" / "not_a_spec"
+    unexpected_dir.mkdir()
+    marker = unexpected_dir / "preserve.txt"
+    marker.write_text("unrelated", encoding="utf-8")
+    malformed_dir = temp_run_manager.runs_dir / "artifacts" / "DS_bad.name"
+    malformed_dir.mkdir()
+
+    _, deleted = temp_run_manager.prune_runs()
+
+    assert f"{old_spec_id}.json" in deleted
+    assert not (temp_run_manager.runs_dir / "artifacts" / old_spec_id).exists()
+    assert (kept_raw / "kept.csv").exists()
+    assert marker.exists()
+    assert malformed_dir.exists()
+
+
+def test_pruning_handles_missing_artifact_directory(temp_run_manager):
+    spec_id = "DS_old_without_artifacts"
+    _write_old_rejected_run(temp_run_manager, spec_id)
+
+    _, deleted = temp_run_manager.prune_runs()
+
+    assert f"{spec_id}.json" in deleted
+
+
+def test_pruning_does_not_follow_artifact_root_outside_runs(temp_run_manager, tmp_path):
+    outside_artifacts = tmp_path / "outside_artifacts"
+    outside_run = outside_artifacts / "DS_old_with_artifacts"
+    outside_raw = outside_run / "raw"
+    outside_raw.mkdir(parents=True)
+    marker = outside_raw / "preserve.txt"
+    marker.write_text("outside", encoding="utf-8")
+
+    artifact_root_link = temp_run_manager.runs_dir / "artifacts"
+    try:
+        artifact_root_link.symlink_to(outside_artifacts, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+    spec_id = "DS_old_with_artifacts"
+    _write_old_rejected_run(temp_run_manager, spec_id)
+
+    _, deleted = temp_run_manager.prune_runs()
+
+    assert f"{spec_id}.json" in deleted
+    assert marker.exists()
+    assert outside_raw.is_dir()
+
+
+def test_pruning_skips_artifact_root_resolved_outside_runs(temp_run_manager, tmp_path, monkeypatch):
+    outside_artifacts = tmp_path / "resolved_outside_artifacts"
+    outside_run = outside_artifacts / "DS_old_with_artifacts"
+    outside_raw = outside_run / "raw"
+    outside_raw.mkdir(parents=True)
+    marker = outside_raw / "preserve.txt"
+    marker.write_text("outside", encoding="utf-8")
+    spec_id = "DS_old_with_artifacts"
+    _write_old_rejected_run(temp_run_manager, spec_id)
+
+    artifact_root = temp_run_manager.runs_dir / "artifacts"
+    original_resolve = Path.resolve
+
+    def resolve_with_external_artifact_root(path, strict=False):
+        if path == artifact_root:
+            return outside_artifacts
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_with_external_artifact_root)
+
+    _, deleted = temp_run_manager.prune_runs()
+
+    assert f"{spec_id}.json" in deleted
+    assert marker.exists()
+
+
+def test_pruning_rejects_artifact_root_resolving_to_sibling_inside_runs(
+    temp_run_manager, monkeypatch
+):
+    spec_id = "DS_run_A"
+    artifacts_root = temp_run_manager.runs_dir / "artifacts"
+    artifacts_root.mkdir()
+    sibling_root = temp_run_manager.runs_dir / "artifacts_alias"
+    target_raw = sibling_root / spec_id / "raw"
+    target_raw.mkdir(parents=True)
+    marker = target_raw / "preserve.txt"
+    marker.write_text("unrelated", encoding="utf-8")
+    _write_old_rejected_run(temp_run_manager, spec_id)
+
+    original_resolve = Path.resolve
+
+    def resolve_artifacts_to_sibling(path, strict=False):
+        if path == artifacts_root:
+            return sibling_root
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_artifacts_to_sibling)
+
+    _, deleted = temp_run_manager.prune_runs()
+
+    assert f"{spec_id}.json" in deleted
+    assert marker.exists()
+    assert target_raw.is_dir()
+
+
+def test_pruning_rejects_spec_directory_resolving_to_sibling_run(
+    temp_run_manager, monkeypatch
+):
+    spec_id = "DS_run_A"
+    artifacts_root = temp_run_manager.runs_dir / "artifacts"
+    spec_dir = artifacts_root / spec_id
+    sibling_spec_dir = artifacts_root / "DS_run_B"
+    spec_dir.mkdir(parents=True)
+    target_raw = sibling_spec_dir / "raw"
+    target_raw.mkdir(parents=True)
+    marker = target_raw / "preserve.txt"
+    marker.write_text("unrelated", encoding="utf-8")
+    _write_old_rejected_run(temp_run_manager, spec_id)
+
+    original_resolve = Path.resolve
+
+    def resolve_spec_to_sibling(path, strict=False):
+        if path == spec_dir:
+            return sibling_spec_dir
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_spec_to_sibling)
+
+    _, deleted = temp_run_manager.prune_runs()
+
+    assert f"{spec_id}.json" in deleted
+    assert spec_dir.is_dir()
+    assert marker.exists()
+    assert target_raw.is_dir()
+
+
+def test_raw_artifact_directory_rejects_resolution_to_sibling_inside_spec(
+    temp_run_manager, monkeypatch
+):
+    spec_id = "DS_run_A"
+    spec_dir = temp_run_manager.runs_dir / "artifacts" / spec_id
+    raw_dir = spec_dir / "raw"
+    alternate_raw_dir = spec_dir / "raw_alias"
+    alternate_raw_dir.mkdir(parents=True)
+    marker = alternate_raw_dir / "preserve.txt"
+    marker.write_text("unrelated", encoding="utf-8")
+
+    original_resolve = Path.resolve
+    raw_resolve_count = [0]
+
+    def resolve_raw_to_sibling(path, strict=False):
+        if path == raw_dir:
+            raw_resolve_count[0] += 1
+            if raw_resolve_count[0] == 2:
+                return alternate_raw_dir
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_raw_to_sibling)
+
+    with pytest.raises(ValueError, match="Raw artifact directory resolves"):
+        temp_run_manager.get_raw_artifact_dir(spec_id)
+
+    assert raw_resolve_count[0] == 2
+    assert raw_dir.is_dir()
+    assert marker.exists()
+    assert alternate_raw_dir.is_dir()
+
+
+def _create_directory_symlink_or_skip(target, link):
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+
+def test_artifact_spec_symlink_is_rejected_and_target_is_preserved(
+    temp_run_manager, tmp_path, caplog
+):
+    spec_id = "DS_linked_spec"
+    artifacts_root = temp_run_manager.runs_dir / "artifacts"
+    artifacts_root.mkdir()
+    outside_target = tmp_path / "outside_spec_target"
+    outside_raw = outside_target / "raw"
+    outside_raw.mkdir(parents=True)
+    marker = outside_raw / "preserve.txt"
+    marker.write_text("outside", encoding="utf-8")
+    spec_link = artifacts_root / spec_id
+    _create_directory_symlink_or_skip(outside_target, spec_link)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        temp_run_manager.get_raw_artifact_dir(spec_id)
+
+    _write_old_rejected_run(temp_run_manager, spec_id)
+    with caplog.at_level("WARNING", logger="core.run_manager"):
+        _, deleted = temp_run_manager.prune_runs()
+
+    assert f"{spec_id}.json" in deleted
+    assert "Skipped unsafe artifact deletion" in caplog.text
+    assert spec_link.is_symlink()
+    assert marker.exists()
+
+
+def test_raw_artifact_symlink_is_rejected_and_target_is_preserved(
+    temp_run_manager, tmp_path
+):
+    spec_id = "DS_linked_raw"
+    raw_dir = temp_run_manager.get_raw_artifact_dir(spec_id)
+    raw_dir.rmdir()
+    outside_raw = tmp_path / "outside_raw_target"
+    outside_raw.mkdir()
+    marker = outside_raw / "preserve.txt"
+    marker.write_text("outside", encoding="utf-8")
+    _create_directory_symlink_or_skip(outside_raw, raw_dir)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        temp_run_manager.get_raw_artifact_dir(spec_id)
+
+    _write_old_rejected_run(temp_run_manager, spec_id)
+    _, deleted = temp_run_manager.prune_runs()
+
+    assert f"{spec_id}.json" in deleted
+    assert marker.exists()
+    assert not raw_dir.is_symlink()
+
+
+def test_pruning_handles_artifact_deletion_failure_without_external_cleanup(
+    temp_run_manager, tmp_path, monkeypatch, caplog
+):
+    spec_id = "DS_artifact_delete_failure"
+    raw_dir = temp_run_manager.get_raw_artifact_dir(spec_id)
+    (raw_dir / "keep.txt").write_text("inside", encoding="utf-8")
+    _write_old_rejected_run(temp_run_manager, spec_id)
+    outside_dir = tmp_path / "unrelated_outside"
+    outside_dir.mkdir()
+    outside_marker = outside_dir / "preserve.txt"
+    outside_marker.write_text("outside", encoding="utf-8")
+
+    attempted_paths = []
+
+    def fail_artifact_removal(path):
+        attempted_paths.append(Path(path))
+        raise PermissionError("simulated deletion failure")
+
+    monkeypatch.setattr("core.run_manager.shutil.rmtree", fail_artifact_removal)
+
+    with caplog.at_level("ERROR", logger="core.run_manager"):
+        _, deleted = temp_run_manager.prune_runs()
+
+    artifact_dir = temp_run_manager.runs_dir / "artifacts" / spec_id
+    assert f"{spec_id}.json" in deleted
+    assert attempted_paths == [artifact_dir]
+    assert artifact_dir.is_dir()
+    assert (raw_dir / "keep.txt").exists()
+    assert outside_marker.exists()
+    assert "Failed to delete artifacts for" in caplog.text
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

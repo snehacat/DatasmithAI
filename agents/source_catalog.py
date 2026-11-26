@@ -1,30 +1,9 @@
 """Static provider hints for planning; verify capabilities and access before use."""
 
-import re
 from dataclasses import dataclass
 from typing import List
 
-
-def normalize_feature_name(name: str) -> str:
-    """Canonicalize spelling and explicitly supported feature aliases.
-
-    Examples
-    --------
-    >>> normalize_feature_name("PM2.5")   == "pm25"
-    >>> normalize_feature_name("pm2_5")   == "pm25"
-    >>> normalize_feature_name("PM 2.5")  == "pm25"
-    >>> normalize_feature_name("no2")     == "no2"
-    >>> normalize_feature_name("timestamp") == "time"
-    >>> normalize_feature_name("river discharge") == "streamflow"
-    >>> normalize_feature_name("river level") == "waterlevel"
-    """
-    compact = re.sub(r"[\s_\-\.]", "", name.lower())
-    aliases = {
-        "timestamp": "time",
-        "riverdischarge": "streamflow",
-        "riverlevel": "waterlevel",
-    }
-    return aliases.get(compact, compact)
+from core.feature_names import normalize_feature_name
 
 
 @dataclass(frozen=True)
@@ -107,7 +86,7 @@ SOURCE_CATALOG = [
         "OpenAQ streams station readings in near-real-time and also archives history. "
         "A free API key is sufficient; no paid tier is required for basic access. "
         "Verify station density and rate limits before use.",
-        connector_available=True, data_origin="measured",
+        connector_available=False, data_origin="measured",
     ),
     SourceCatalogEntry(
         "cpcb_namp_air_quality", "CPCB NAMP",
@@ -127,7 +106,7 @@ SOURCE_CATALOG = [
         "Completely free, no API key required. Provides hourly air-quality forecasts "
         "and recent historical values via a simple REST endpoint. "
         "Verify before use: coverage and variables may change between API versions.",
-        connector_available=True, data_origin="modeled",
+        connector_available=False, data_origin="modeled",
     ),
     SourceCatalogEntry(
         "usgs_earthquake_catalog", "USGS Earthquake Catalog",

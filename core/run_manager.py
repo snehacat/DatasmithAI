@@ -9,6 +9,7 @@ import json
 import time
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timedelta
@@ -98,6 +99,82 @@ class RunManager:
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, default=str)
         os.replace(tmp_path, path)
+
+    def _artifact_spec_dir(self, spec_id: str) -> Tuple[Path, Path]:
+        """Return the validated artifacts root and one run's artifact directory."""
+        if not isinstance(spec_id, str) or not re.fullmatch(r"DS_[A-Za-z0-9_-]+", spec_id):
+            raise ValueError(f"Invalid spec_id for artifact storage: {spec_id!r}")
+
+        artifacts_path = self.runs_dir / "artifacts"
+        if artifacts_path.is_symlink():
+            raise ValueError("Artifact root must not be a symbolic link")
+
+        artifacts_root = artifacts_path.resolve()
+        if artifacts_root != artifacts_path:
+            raise ValueError("Artifact root resolves to an unexpected directory")
+        if artifacts_root.parent != self.runs_dir:
+            raise ValueError("Artifact root resolves outside the runs directory")
+
+        spec_path = artifacts_root / spec_id
+        if spec_path.is_symlink():
+            raise ValueError(f"Artifact directory must not be a symbolic link: {spec_id}")
+
+        spec_dir = spec_path.resolve()
+        if spec_dir != spec_path:
+            raise ValueError(f"Artifact directory resolves to an unexpected directory: {spec_id}")
+        if spec_dir.parent != artifacts_root:
+            raise ValueError(f"Artifact directory resolves outside the artifact root: {spec_id}")
+
+        return artifacts_root, spec_dir
+
+    def get_raw_artifact_dir(self, spec_id: str) -> Path:
+        """Create and return ``runs/artifacts/<spec_id>/raw`` for a run."""
+        artifacts_root, spec_dir = self._artifact_spec_dir(spec_id)
+        raw_dir = spec_dir / "raw"
+        if raw_dir.is_symlink():
+            raise ValueError(f"Raw artifact directory must not be a symbolic link: {spec_id}")
+
+        resolved_raw_dir = raw_dir.resolve()
+        if (
+            resolved_raw_dir != raw_dir
+            or resolved_raw_dir.parent != spec_dir
+            or resolved_raw_dir.parent.parent != artifacts_root
+        ):
+            raise ValueError(f"Raw artifact directory resolves outside the artifact root: {spec_id}")
+
+        raw_dir.mkdir(parents=True, exist_ok=True)
+
+        # Recheck after creation so an existing symlink cannot redirect the returned path.
+        artifacts_root, spec_dir = self._artifact_spec_dir(spec_id)
+        resolved_raw_dir = raw_dir.resolve()
+        if (
+            raw_dir.is_symlink()
+            or resolved_raw_dir != raw_dir
+            or resolved_raw_dir.parent != spec_dir
+            or resolved_raw_dir.parent.parent != artifacts_root
+        ):
+            raise ValueError(f"Raw artifact directory resolves outside the artifact root: {spec_id}")
+        return resolved_raw_dir
+
+    def _delete_artifact_dir_for_spec(self, spec_id: str) -> None:
+        """Delete only the validated artifact directory corresponding to a pruned run."""
+        try:
+            _, artifact_dir = self._artifact_spec_dir(spec_id)
+        except ValueError as exc:
+            logger.warning(f"Skipped unsafe artifact deletion for {spec_id!r}: {exc}")
+            return
+
+        if not artifact_dir.exists():
+            return
+        if not artifact_dir.is_dir():
+            logger.warning(f"Skipped non-directory artifact path: {artifact_dir}")
+            return
+
+        try:
+            shutil.rmtree(artifact_dir)
+            logger.info(f"Deleted artifacts for pruned run: {spec_id}")
+        except OSError as exc:
+            logger.error(f"Failed to delete artifacts for {spec_id}: {exc}")
     
     def load_spec(self, spec_id: str) -> Optional[DatasetSpec]:
         """
@@ -247,6 +324,7 @@ class RunManager:
                             filepath.unlink()
                             actually_deleted.append(filename)
                             logger.info(f"Deleted old run: {filename}")
+                            self._delete_artifact_dir_for_spec(filepath.stem)
                     else:
                         logger.warning(f"Skipped unsafe deletion: {filename}")
                 except Exception as e:

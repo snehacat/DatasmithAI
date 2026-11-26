@@ -16,6 +16,11 @@ from core.dataset_spec import (
     create_initial_spec,
     validate_spec,
 )
+from core.llm_wrapper import (
+    LLMConnectionError,
+    LLMResponseError,
+    LLMTimeoutError,
+)
 
 
 def make_requirement(**overrides):
@@ -199,7 +204,7 @@ def test_llm_exception_does_not_fail_supported_planning(planner, monkeypatch):
             False, False, True, "global", "all", "Test.",
         ),
     ])
-    planner.llm.call.side_effect = RuntimeError("offline")
+    planner.llm.call.side_effect = LLMConnectionError("Ollama offline")
     spec = make_spec(geography=None)
     assert planner.plan(spec) is spec
     assert spec.plan.source_requirements
@@ -496,6 +501,66 @@ def test_feature_matching_does_not_match_unrelated_substrings():
     assert PlanningAgent._feature_matches(
         entry, ["time zone", "river", "level", "flow", "water level sensor"]
     ) == []
+
+
+def test_source_ranking_prioritizes_feature_coverage(planner, monkeypatch):
+    entries = [
+        SourceCatalogEntry(
+            "partial_source", "Partial Source", ["weather"], ["temperature"],
+            "api", False, False, True, "global", "all", "Test.",
+        ),
+        SourceCatalogEntry(
+            "multi_source", "Multi Source", ["weather"], ["temperature", "humidity", "wind speed"],
+            "api", False, False, True, "global", "all", "Test.",
+        ),
+    ]
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", entries)
+    spec = make_spec(expected_features=["temperature", "humidity", "wind speed"])
+    planner.plan(spec, use_llm=False)
+
+    assert spec.plan.source_requirements
+    assert spec.plan.source_requirements[0].source_type == "multi_source"
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("rainfall", "precipitation"),
+        ("precipitation", "rainfall"),
+        ("ozone", "o3"),
+        ("O3", "ozone"),
+        ("river discharge", "streamflow"),
+        ("timestamp", "time"),
+    ],
+)
+def test_feature_aliases_match_well_established_equivalences(left, right):
+    entry = SourceCatalogEntry(
+        "alias_source", "Alias Source", ["environmental"], [left],
+        "api", False, False, True, "global", "all", "Test.",
+    )
+    assert PlanningAgent._feature_matches(entry, [right])
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("river discharge", "river level"),
+        ("water level", "streamflow"),
+        ("temperature", "fever"),
+        ("ozone", "no2"),
+    ],
+)
+def test_feature_aliases_do_not_merge_related_but_distinct_measurements(left, right):
+    entry = SourceCatalogEntry(
+        "distinct_source", "Distinct Source", ["environmental"], [left],
+        "api", False, False, True, "global", "all", "Test.",
+    )
+    assert PlanningAgent._feature_matches(entry, [right]) == []
+
+
+def test_topic_matching_requires_word_boundaries_not_substrings():
+    assert not PlanningAgent._overlaps(["firewall"], {"fire", "wildfire"})
+    assert PlanningAgent._overlaps(["wildfire"], {"fire", "wildfire"})
 
 
 def test_flood_prediction_plan_matches_river_feature_aliases(planner):
@@ -870,7 +935,7 @@ def test_open_meteo_air_quality_in_catalog():
     assert entry.geography == "global", f"Expected geography='global', got '{entry.geography}'"
     # Must provide standard air-quality pollutants
     provided_norm = {normalize_feature_name(p) for p in entry.provides}
-    for pollutant in ("pm25", "pm10", "o3", "no2", "so2"):
+    for pollutant in ("pm25", "pm10", "ozone", "no2", "so2"):
         assert pollutant in provided_norm, (
             f"open_meteo_air_quality should provide '{pollutant}'; got {provided_norm}"
         )
@@ -1150,12 +1215,12 @@ def test_relevant_source_without_connector_can_still_be_required(planner, monkey
     assert any("without an implemented connector" in warning for warning in spec.warnings)
 
 
-def test_openaq_and_open_meteo_aq_are_connector_available():
-    """openaq_air_quality and open_meteo_air_quality must have connector_available=True."""
+def test_openaq_and_open_meteo_aq_have_no_implemented_connector_claim():
+    """Catalog providers are known sources, but no retrieval connector is implemented."""
     from agents.source_catalog import SOURCE_CATALOG as CAT
     catalog = {e.source_type: e for e in CAT}
     for key in ("openaq_air_quality", "open_meteo_air_quality"):
-        assert catalog[key].connector_available, f"{key} should have connector_available=True"
+        assert catalog[key].connector_available is False
 
 
 def test_source_requirement_has_data_origin_field():
@@ -1549,3 +1614,328 @@ def test_reasoning_mentions_source_counts():
     assert has_count or has_word, (
         f"reasoning doesn't mention source counts or 'source': {reasoning!r}"
     )
+
+
+def test_llm_duplicate_queries_are_normalized_and_deduplicated(planner, monkeypatch):
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", [
+        SourceCatalogEntry(
+            "single_aq", "Single AQ", ["air quality"], ["pm2.5"],
+            "api", False, False, True, "global", "live", "Test.",
+        ),
+    ])
+    planner.llm.call.return_value = SimpleNamespace(content={
+        "extra_queries": [
+            "pm2.5   monitoring station data",
+            "PM2.5 monitoring station data",
+        ],
+        "reasoning": "AQ reasoning.",
+    })
+    spec = make_spec(
+        domain="environmental",
+        subdomain="air quality",
+        expected_features=["pm2.5"],
+        geography=None,
+    )
+    planner.plan(spec)
+
+    matches = [q.query for q in spec.plan.search_queries if "pm2.5" in q.query.lower()]
+    assert len(matches) == 1
+
+
+def test_llm_query_rejects_conflicting_geography(planner, monkeypatch):
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", [
+        SourceCatalogEntry(
+            "single_aq", "Single AQ", ["air quality"], ["pm2.5"],
+            "api", False, False, True, "global", "live", "Test.",
+        ),
+    ])
+    planner.llm.call.return_value = SimpleNamespace(content={
+        "extra_queries": ["California pm2.5 air quality monitoring"],
+        "reasoning": "AQ reasoning.",
+    })
+    spec = make_spec(
+        domain="environmental",
+        subdomain="air quality",
+        expected_features=["pm2.5"],
+        geography="Delhi",
+    )
+    planner.plan(spec)
+
+    assert not any("California" in q.query for q in spec.plan.search_queries)
+
+
+@pytest.mark.parametrize(
+    ("requested", "query", "expected"),
+    [
+        ("India", "Delhi pm2.5 air quality monitoring", True),
+        ("United States", "California pm2.5 air quality monitoring", True),
+        ("California", "California pm2.5 air quality monitoring", True),
+        ("California", "New York pm2.5 air quality monitoring", False),
+        ("Delhi", "Delhi and California pm2.5 monitoring", False),
+        ("California", "California and New York pm2.5 monitoring", False),
+    ],
+)
+def test_llm_geographic_hierarchy_and_conflicts(
+    planner, monkeypatch, requested, query, expected
+):
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", [
+        SourceCatalogEntry(
+            "single_aq", "Single AQ", ["air quality"], ["pm2.5"],
+            "api", False, False, True, "global", "live", "Test.",
+        ),
+    ])
+    planner.llm.call.return_value = SimpleNamespace(content={
+        "extra_queries": [query],
+        "reasoning": "AQ reasoning.",
+    })
+    spec = make_spec(
+        domain="environmental",
+        subdomain="air quality",
+        expected_features=["pm2.5"],
+        geography=requested,
+    )
+    planner.plan(spec)
+
+    present = any(query.casefold() == q.query.casefold() for q in spec.plan.search_queries)
+    assert present is expected
+
+
+def test_location_sets_do_not_treat_shared_us_alias_as_state_equivalence():
+    requested = PlanningAgent._mentioned_locations("California")
+    queried = PlanningAgent._mentioned_locations("New York")
+
+    assert "us" not in requested
+    assert "us" not in queried
+    assert not PlanningAgent._locations_compatible("California", "New York")
+
+
+@pytest.mark.parametrize(
+    ("geography", "query"),
+    [
+        ("Delhi", "Texas pm2.5 air quality monitoring"),
+        ("California", "Delhi pm2.5 air quality monitoring"),
+        ("India", "California pm2.5 air quality monitoring"),
+        ("Mars", "Delhi pm2.5 air quality monitoring"),
+        ("Atlantis", "Texas ozone monitoring"),
+    ],
+)
+def test_llm_query_rejects_conflicting_or_unsupported_geography(
+    planner, monkeypatch, geography, query
+):
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", [
+        SourceCatalogEntry(
+            "single_aq", "Single AQ", ["air quality"], ["pm2.5", "ozone"],
+            "api", False, False, True, "global", "live", "Test.",
+        ),
+    ])
+    planner.llm.call.return_value = SimpleNamespace(content={
+        "extra_queries": [query],
+        "reasoning": "AQ reasoning.",
+    })
+    spec = make_spec(
+        domain="environmental",
+        subdomain="air quality",
+        expected_features=["pm2.5", "ozone"],
+        geography=geography,
+    )
+    planner.plan(spec)
+
+    assert not any(query.casefold() == q.query.casefold() for q in spec.plan.search_queries)
+
+
+def test_llm_query_requires_preserved_requested_feature(planner, monkeypatch):
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", [
+        SourceCatalogEntry(
+            "single_aq", "Single AQ", ["air quality"], ["pm2.5"],
+            "api", False, False, True, "global", "live", "Test.",
+        ),
+    ])
+    planner.llm.call.return_value = SimpleNamespace(content={
+        "extra_queries": ["Delhi air quality monitoring archive"],
+        "reasoning": "AQ reasoning.",
+    })
+    spec = make_spec(
+        domain="environmental",
+        subdomain="air quality",
+        expected_features=["pm2.5"],
+        geography="Delhi",
+    )
+    planner.plan(spec)
+
+    assert not any(
+        "Delhi air quality monitoring archive" == q.query
+        for q in spec.plan.search_queries
+    )
+
+
+def test_unexpected_programming_error_is_not_replaced_by_successful_plan(
+    planner, monkeypatch
+):
+    monkeypatch.setattr(
+        planner,
+        "_candidate_sources",
+        lambda spec: (_ for _ in ()).throw(RuntimeError("unexpected source bug")),
+    )
+    spec = make_spec()
+
+    with pytest.raises(RuntimeError, match="unexpected source bug"):
+        planner.plan(spec)
+
+    assert spec.plan is None
+
+
+def test_unexpected_source_value_error_propagates_unchanged(
+    planner, monkeypatch
+):
+    original = ValueError("bad source shape")
+    monkeypatch.setattr(
+        planner,
+        "_candidate_sources",
+        lambda spec: (_ for _ in ()).throw(original),
+    )
+    spec = make_spec()
+
+    with pytest.raises(ValueError, match="bad source shape") as caught:
+        planner.plan(spec)
+
+    assert caught.value is original
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TypeError("unexpected type bug"),
+        KeyError("unexpected key bug"),
+        RuntimeError("unrelated runtime bug"),
+    ],
+)
+def test_unexpected_llm_errors_propagate_unchanged(planner, monkeypatch, error):
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", [
+        SourceCatalogEntry(
+            "single_weather", "Single Weather", ["weather"], ["temperature"],
+            "api", False, False, True, "global", "all", "Test.",
+        ),
+    ])
+    planner.llm.call.side_effect = error
+    spec = make_spec(geography=None)
+
+    with pytest.raises(type(error)) as caught:
+        planner.plan(spec)
+
+    assert caught.value is error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LLMConnectionError("offline"),
+        LLMTimeoutError("request timeout"),
+        LLMResponseError("invalid response"),
+    ],
+)
+def test_expected_llm_failures_use_rule_based_fallback(planner, monkeypatch, error):
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", [
+        SourceCatalogEntry(
+            "single_weather", "Single Weather", ["weather"], ["temperature"],
+            "api", False, False, True, "global", "all", "Test.",
+        ),
+    ])
+    planner.llm.call.side_effect = error
+    spec = make_spec(geography=None)
+
+    assert planner.plan(spec) is spec
+    assert spec.plan.source_requirements
+    assert "LLM unavailable, planner used rules only" in spec.warnings
+
+
+def test_feature_coverage_can_outweigh_temporal_suitability_in_ranking(
+    planner, monkeypatch
+):
+    entries = [
+        SourceCatalogEntry(
+            "live_partial", "Live Partial", ["weather"],
+            ["temperature"], "api", False, False, True, "global", "live", "Test.",
+        ),
+        SourceCatalogEntry(
+            "historical_complete", "Historical Complete", ["weather"],
+            ["temperature", "humidity", "wind speed"], "api",
+            False, False, True, "global", "historical", "Test.",
+        ),
+    ]
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", entries)
+    spec = make_spec(
+        expected_features=["temperature", "humidity", "wind speed"],
+        freshness_need="live",
+    )
+    candidates, _ = planner._candidate_sources(spec)
+
+    assert candidates[0].source_type == "historical_complete"
+
+
+def test_feature_coverage_can_outweigh_geographic_suitability_in_ranking(
+    planner, monkeypatch
+):
+    entries = [
+        SourceCatalogEntry(
+            "india_partial", "India Partial", ["weather"],
+            ["temperature"], "api", False, False, True, "india", "all", "Test.",
+        ),
+        SourceCatalogEntry(
+            "global_complete", "Global Complete", ["weather"],
+            ["temperature", "humidity", "wind speed"], "api",
+            False, False, True, "global", "all", "Test.",
+        ),
+    ]
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", entries)
+    spec = make_spec(expected_features=["temperature", "humidity", "wind speed"])
+    candidates, _ = planner._candidate_sources(spec)
+
+    assert candidates[0].source_type == "global_complete"
+
+
+def test_feature_coverage_can_outweigh_connector_availability_in_ranking(
+    planner, monkeypatch
+):
+    entries = [
+        SourceCatalogEntry(
+            "partial_connector", "Partial Connector", ["weather"],
+            ["temperature"], "api", False, False, True, "global", "all", "Test.",
+            connector_available=True,
+        ),
+        SourceCatalogEntry(
+            "complete_no_connector", "Complete No Connector", ["weather"],
+            ["temperature", "humidity", "wind speed"], "api",
+            False, False, True, "global", "all", "Test.",
+            connector_available=False,
+        ),
+    ]
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", entries)
+    spec = make_spec(expected_features=["temperature", "humidity", "wind speed"])
+    candidates, _ = planner._candidate_sources(spec)
+
+    assert candidates[0].source_type == "complete_no_connector"
+
+
+def test_hard_free_constraint_cannot_be_overridden_by_ranking(
+    planner, monkeypatch
+):
+    entries = [
+        SourceCatalogEntry(
+            "paid_multi_feature", "Paid Multi Feature", ["weather"],
+            ["temperature", "humidity", "wind speed"], "api",
+            False, False, False, "global", "all", "Test.",
+        ),
+        SourceCatalogEntry(
+            "free_partial", "Free Partial", ["weather"],
+            ["temperature"], "api",
+            False, False, True, "global", "all", "Test.",
+        ),
+    ]
+    monkeypatch.setattr(planning_module, "SOURCE_CATALOG", entries)
+    spec = make_spec(
+        expected_features=["temperature", "humidity", "wind speed"],
+        constraints=["free sources only"],
+    )
+    planner.plan(spec, use_llm=False)
+
+    assert {source.source_type for source in spec.plan.source_requirements} == {"free_partial"}

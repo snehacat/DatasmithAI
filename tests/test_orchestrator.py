@@ -452,5 +452,57 @@ def test_fatal_agent_error_is_not_added_twice(temp_run_manager):
     matching = [error for error in saved.errors if "boom" in error]
     assert len(matching) == 1
 
+
+def test_structural_validation_failure_is_fatal_and_stops_pipeline(temp_run_manager):
+    """validate_spec() failures must fail the stage and halt downstream agents."""
+    ran = []
+    with patch('core.orchestrator.get_run_manager', return_value=temp_run_manager):
+        orch = Orchestrator(validate_after_each=True)
+
+        def broken_planner(spec: DatasetSpec) -> DatasetSpec:
+            from core.dataset_spec import PlanSpec, SearchQuery
+            # Invalid: query references non-existent source_type
+            spec.plan = PlanSpec(
+                search_queries=[
+                    SearchQuery(
+                        query="test",
+                        purpose="test",
+                        related_source_type="missing_source_type",
+                        priority=1,
+                    )
+                ]
+            )
+            return spec
+
+        def downstream(spec: DatasetSpec) -> DatasetSpec:
+            ran.append("downstream")
+            return spec
+
+        orch.register_agent(AgentDefinition(
+            name="BrokenPlanner",
+            run_func=broken_planner,
+            required_inputs=[],
+            outputs=["plan"],
+            skip_if_unsupported=False,
+        ))
+        orch.register_agent(AgentDefinition(
+            name="Downstream",
+            run_func=downstream,
+            required_inputs=["plan"],
+            outputs=[],
+            skip_if_unsupported=False,
+        ))
+
+        spec = orch.run("Weather", "weather data for Delhi")
+
+    assert spec.pipeline_status == PipelineStatus.FAILED
+    assert spec.execution_history[-1].status == AgentStatus.FAILED
+    assert "Structural validation failed" in (spec.execution_history[-1].error_message or "")
+    assert any("missing_source_type" in e for e in spec.errors)
+    assert spec.warnings == []
+    assert ran == []
+    saved = temp_run_manager.load_spec("current")
+    assert saved.pipeline_status == PipelineStatus.FAILED
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

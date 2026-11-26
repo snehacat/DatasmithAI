@@ -177,6 +177,7 @@ class Orchestrator:
             already_done = spec.has_agent_succeeded(agent_def.name)
             try:
                 spec = self._run_agent(spec, agent_def)
+                self.current_spec = spec
                 if spec.has_agent_succeeded(agent_def.name):
                     last_successful_agent = agent_def.name
 
@@ -391,15 +392,22 @@ class Orchestrator:
                     f"user wait: {float(stats.get('user_wait_seconds', 0.0) or 0.0):.2f}s"
                 )
             
-            # Validate if enabled
+            # Validate if enabled — structural violations are fatal contract failures
             if self.validate_after_each:
                 is_valid, errors = validate_spec(updated_spec)
                 if not is_valid:
-                    logger.warning(f"Validation warnings after {agent_def.name}:")
+                    exec.status = AgentStatus.FAILED
+                    exec.error_message = f"Structural validation failed: {'; '.join(errors)}"
+                    updated_spec.execution_history[-1] = exec
+                    updated_spec.pipeline_status = PipelineStatus.FAILED
+                    logger.error(f"Structural validation failed after {agent_def.name}:")
                     for error in errors:
-                        logger.warning(f"  - {error}")
-                        updated_spec.add_warning(f"{agent_def.name}: {error}")
-            
+                        logger.error(f"  - {error}")
+                        updated_spec.add_error(f"{agent_def.name}: {error}")
+                    if self.auto_save:
+                        self.run_manager.save_spec(updated_spec)
+                    return updated_spec
+
             # Save if enabled
             if self.auto_save:
                 self.run_manager.save_spec(updated_spec)

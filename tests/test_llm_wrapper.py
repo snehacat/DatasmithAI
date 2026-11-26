@@ -2,11 +2,24 @@
 Tests for LLM Wrapper
 """
 
-import pytest
+import json
 import logging
+
 import httpx
+import ollama
+import pytest
 from pydantic import BaseModel
-from core.llm_wrapper import LLMWrapper, LLMConfig, get_llm, reset_llm
+from pydantic import ValidationError
+from core.llm_wrapper import (
+    LLMConnectionError,
+    LLMConfig,
+    LLMError,
+    LLMResponseError,
+    LLMTimeoutError,
+    LLMWrapper,
+    get_llm,
+    reset_llm,
+)
 
 
 class SampleSchema(BaseModel):
@@ -58,7 +71,7 @@ def test_schema_validation():
     llm = LLMWrapper()
 
     # Missing 'name' field: fails validation on every attempt, so the wrapper raises
-    with pytest.raises(RuntimeError, match="validation"):
+    with pytest.raises(LLMResponseError, match="validation"):
         llm.call(
             prompt='Return JSON: {"value": 42, "success": true}',
             expected_schema=SampleSchema
@@ -103,7 +116,7 @@ def test_invalid_json_handling():
     
     # Force non-JSON mode and ask for invalid JSON
        # Invalid JSON fails parsing on every attempt, so the wrapper raises
-    with pytest.raises(RuntimeError, match="JSON"):
+    with pytest.raises(LLMResponseError, match="JSON"):
         llm.call(
             prompt='Return invalid JSON: {name: test, value: invalid}',
             force_json=False  # Don't force JSON format
@@ -161,7 +174,7 @@ def make_llm(replies):
 
 def test_non_object_json_is_rejected_with_clear_error():
     llm = make_llm(['[1, 2, 3]', '[1, 2, 3]'])
-    with pytest.raises(RuntimeError, match="expected a JSON object, got list"):
+    with pytest.raises(LLMResponseError, match="expected a JSON object, got list"):
         llm.call("give me json")
     assert len(llm.client.prompts) == 2   # it retried once
 
@@ -235,19 +248,313 @@ def test_httpx_connect_error_is_reported_as_connection_failure():
 
     llm = LLMWrapper()
     llm.client = Spy()
-    with pytest.raises(RuntimeError, match="Cannot connect to Ollama"):
+    with pytest.raises(LLMConnectionError, match="Cannot connect to Ollama") as caught:
         llm.call("hello")
+    assert isinstance(caught.value.__cause__, httpx.ConnectError)
+
+
+def test_httpx_request_timeout_uses_timeout_error_and_preserves_cause():
+    timeout = httpx.ReadTimeout("request timed out")
+
+    class Spy:
+        def chat(self, **kwargs):
+            raise timeout
+
+    llm = LLMWrapper()
+    llm.client = Spy()
+    with pytest.raises(LLMTimeoutError) as caught:
+        llm.call("hello")
+
+    assert isinstance(caught.value, TimeoutError)
+    assert caught.value.__cause__ is timeout
+
+
+def test_malformed_json_uses_response_error_and_preserves_cause():
+    llm = make_llm(["not json", "still not json"])
+    with pytest.raises(LLMResponseError) as caught:
+        llm.call("give me json")
+
+    assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        json.JSONDecodeError("invalid response JSON", "{", 0),
+        httpx.DecodingError("invalid response encoding"),
+    ],
+)
+def test_client_response_decoding_errors_use_response_error(error):
+    class Spy:
+        def chat(self, **kwargs):
+            raise error
+
+    llm = LLMWrapper()
+    llm.client = Spy()
+    with pytest.raises(LLMResponseError) as caught:
+        llm.call("hello")
+
+    assert caught.value.__cause__ is error
+
+
+def test_client_response_validation_error_uses_response_error():
+    with pytest.raises(ValidationError) as validation:
+        SampleSchema.model_validate({})
+    error = validation.value
+
+    class Spy:
+        def chat(self, **kwargs):
+            raise error
+
+    llm = LLMWrapper()
+    llm.client = Spy()
+    with pytest.raises(LLMResponseError) as caught:
+        llm.call("hello")
+
+    assert caught.value.__cause__ is error
+
+
+def test_total_timeout_uses_custom_timeout_error():
+    llm = LLMWrapper(LLMConfig(total_timeout_seconds=0))
+
+    with pytest.raises(LLMTimeoutError) as caught:
+        llm.call("hello")
+
+    assert caught.value.__cause__ is None
+
+
+def test_schema_validation_exhaustion_uses_response_error_and_preserves_cause():
+    llm = make_llm(['{"value": 42, "success": true}'] * 2)
+
+    with pytest.raises(LLMResponseError) as caught:
+        llm.call("give me json", expected_schema=SampleSchema)
+
+    assert isinstance(caught.value.__cause__, ValidationError)
+
+
+def test_invalid_response_structure_uses_response_error_and_preserves_cause():
+    class Spy:
+        def chat(self, **kwargs):
+            return {"message": {}}
+
+    llm = LLMWrapper()
+    llm.client = Spy()
+    with pytest.raises(LLMResponseError) as caught:
+        llm.call("hello")
+
+    assert isinstance(caught.value.__cause__, KeyError)
+
+
+@pytest.mark.parametrize("error", [
+    TypeError("unexpected type bug"),
+    KeyError("unexpected key bug"),
+    RuntimeError("unrelated runtime bug"),
+])
+def test_unexpected_client_errors_are_not_reclassified(error):
+    class Spy:
+        def chat(self, **kwargs):
+            raise error
+
+    llm = LLMWrapper()
+    llm.client = Spy()
+    with pytest.raises(type(error)) as caught:
+        llm.call("hello")
+
+    assert caught.value is error
 
 
 def test_model_not_found_has_pull_command():
     class Spy:
         def chat(self, **kwargs):
-            raise RuntimeError("model 'missing-model' not found")
+            raise ollama.ResponseError("model 'missing-model' not found", status_code=404)
 
     llm = LLMWrapper(LLMConfig(model_name="missing-model"))
     llm.client = Spy()
-    with pytest.raises(RuntimeError, match=r"Run: ollama pull missing-model"):
+    with pytest.raises(LLMError, match=r"Run: ollama pull missing-model") as caught:
         llm.call("hello")
+    assert isinstance(caught.value.__cause__, ollama.ResponseError)
+
+
+def test_real_transport_per_attempt_timeout_is_enforced_without_shared_mutation():
+    """Local loopback slow server must trigger httpx read timeout at attempt_timeout."""
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    stop_event = threading.Event()
+
+    class SlowHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            stop_event.wait(2.0)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"message": {"content": "{\\"ok\\": true}"}}')
+            except OSError:
+                pass
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        config = LLMConfig(
+            per_attempt_timeout_seconds=0.1,
+            total_timeout_seconds=0.05,
+            max_retries=0,
+        )
+        llm = LLMWrapper(config)
+        llm._host = f"http://127.0.0.1:{port}"
+        llm.client = llm._build_client(config.per_attempt_timeout_seconds)
+        initial_timeout = llm.client._client.timeout
+
+        start = time.monotonic()
+        with pytest.raises(LLMTimeoutError):
+            llm.call("hello")
+        elapsed = time.monotonic() - start
+
+        # Must time out well before the 2.0s server delay
+        assert elapsed < 1.2
+        # Shared client timeout must remain untouched
+        assert llm.client._client.timeout == initial_timeout
+    finally:
+        stop_event.set()
+        server.shutdown()
+        server.server_close()
+
+
+def test_retry_attempt_uses_remaining_total_budget_without_mutating_shared_client(monkeypatch):
+    """When attempt 1 consumes part of total_timeout, attempt 2 gets bounded <= remaining."""
+    import time
+
+    timeouts_seen = []
+
+    class FakeBoundedClient:
+        def __init__(self, host=None, timeout=None):
+            self.host = host
+            self.timeout = timeout
+            self._client = type("Inner", (), {"timeout": timeout, "close": lambda self: None})()
+
+        def chat(self, **kwargs):
+            timeouts_seen.append(self.timeout)
+            time.sleep(0.12)
+            if len(timeouts_seen) == 1:
+                return {"message": {"content": "not json"}}
+            return {"message": {"content": '{"ok": true}'}}
+
+    monkeypatch.setattr("core.llm_wrapper.OllamaClient", FakeBoundedClient)
+    config = LLMConfig(
+        per_attempt_timeout_seconds=0.5,
+        total_timeout_seconds=0.35,
+        max_retries=1,
+    )
+    llm = LLMWrapper(config)
+    initial_shared_timeout = llm.client._client.timeout
+
+    res = llm.call("hello")
+    assert res.success is True
+    assert len(timeouts_seen) == 2
+    assert timeouts_seen[0].read == pytest.approx(0.35, abs=0.05)
+    assert timeouts_seen[1].read < 0.30
+    assert llm.client._client.timeout == initial_shared_timeout
+
+
+def test_none_client_still_uses_bounded_timeout_never_unbounded_fallback(monkeypatch):
+    timeouts_seen = []
+
+    class FakeBoundedClient:
+        def __init__(self, host=None, timeout=None):
+            timeouts_seen.append(timeout)
+            self._client = type("Inner", (), {"timeout": timeout, "close": lambda self: None})()
+
+        def chat(self, **kwargs):
+            return {"message": {"content": '{"ok": true}'}}
+
+    monkeypatch.setattr("core.llm_wrapper.OllamaClient", FakeBoundedClient)
+    llm = LLMWrapper(LLMConfig(per_attempt_timeout_seconds=1.5, total_timeout_seconds=2.0))
+    llm.client = None
+
+    res = llm.call("hello")
+    assert res.success is True
+    assert len(timeouts_seen) == 2  # __init__ + bounded fallback in call()
+    assert timeouts_seen[1] is not None
+    assert timeouts_seen[1].read == pytest.approx(1.5, abs=0.1)
+
+
+def test_concurrent_llm_calls_do_not_corrupt_timeouts_or_call_count(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    class ConcurrentClient:
+        def __init__(self, host=None, timeout=None):
+            self.timeout = timeout
+            self._client = type("Inner", (), {"timeout": timeout, "close": lambda self: None})()
+
+        def chat(self, **kwargs):
+            return {"message": {"content": '{"ok": true}'}}
+
+    monkeypatch.setattr("core.llm_wrapper.OllamaClient", ConcurrentClient)
+    llm = LLMWrapper(LLMConfig(per_attempt_timeout_seconds=2.0, total_timeout_seconds=1.0))
+    shared_timeout = llm.client._client.timeout
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda i: llm.call(f"prompt {i}"), range(12)))
+
+    assert all(r.success and r.content == {"ok": True} for r in results)
+    assert llm.get_call_count() == 12
+    assert llm.client._client.timeout == shared_timeout
+
+
+def test_total_budget_blocks_retry_after_slow_first_attempt_and_closes_scoped_client(monkeypatch):
+    """If attempt 1 consumes total_timeout_seconds, retry is blocked and scoped client closes."""
+    import time
+
+    created_clients = []
+
+    class InnerSpy:
+        def __init__(self, timeout):
+            self.timeout = timeout
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class ScopedClientSpy:
+        def __init__(self, host=None, timeout=None):
+            self.timeout = timeout
+            self.calls = 0
+            self._client = InnerSpy(timeout)
+            created_clients.append(self)
+
+        def chat(self, **kwargs):
+            self.calls += 1
+            time.sleep(0.18)
+            return {"message": {"content": "invalid json"}}
+
+    monkeypatch.setattr("core.llm_wrapper.OllamaClient", ScopedClientSpy)
+    llm = LLMWrapper(
+        LLMConfig(
+            per_attempt_timeout_seconds=0.5,
+            total_timeout_seconds=0.15,
+            max_retries=1,
+        )
+    )
+    shared_client = created_clients[0]
+
+    with pytest.raises(LLMTimeoutError, match="exceeded total timeout"):
+        llm.call("hello")
+
+    # Shared client was never closed or used for the tighter scoped attempt
+    assert shared_client._client.closed is False
+    assert shared_client.calls == 0
+    # Exactly one request-scoped client was created, called once, and closed safely
+    assert len(created_clients) == 2
+    scoped = created_clients[1]
+    assert scoped.calls == 1
+    assert scoped._client.closed is True
 
 if __name__ == "__main__":
     # Run tests
