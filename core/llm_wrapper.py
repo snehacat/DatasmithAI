@@ -13,14 +13,17 @@ Features:
 """
 
 import json
+import threading
 import time
 import logging
 import os
-from typing import Dict, Any, Optional, Type
-from pydantic import BaseModel, ValidationError
+from typing import Any, Dict, Optional, Tuple, Type
+from pydantic import BaseModel, Field, ValidationError
 import httpx
 import ollama
 from ollama import Client as OllamaClient
+
+_REAL_OLLAMA_CLIENT = OllamaClient
 
 
 # Setup logging
@@ -50,9 +53,20 @@ class LLMConfig(BaseModel):
     top_p: float = 0.9
     num_predict: int = 800   # analyzer JSON is ~150 tokens; 800 is a safe cap
     num_ctx: int = 4096      # prompt is ~600 tokens; a smaller context is faster on CPU
-    total_timeout_seconds: int = 120  # Total time limit for all attempts (~2 minutes)
-    per_attempt_timeout_seconds: int = 60  # Per-attempt timeout (default 60s for analyzer)
-    max_retries: int = 1  # Maximum 1 retry (2 total attempts)
+    total_timeout_seconds: float = Field(
+        120.0,
+        ge=0.0,
+        description=(
+            "Total retry-budget threshold checked between attempts and used to bound "
+            "each attempt's transport timeout (not a hard mid-stream wall-clock interrupt)."
+        ),
+    )
+    per_attempt_timeout_seconds: float = Field(
+        60.0,
+        gt=0.0,
+        description="Per-attempt transport inactivity timeout (connect/read/write/pool) in seconds.",
+    )
+    max_retries: int = Field(1, ge=0)  # Maximum 1 retry (2 total attempts)
     keep_alive: str = "30m"  # keep the model loaded between calls (avoids 15-25s reloads)
 
 class LLMResponse(BaseModel):
@@ -85,22 +99,53 @@ class LLMWrapper:
         """
         self.config = config or LLMConfig()
         self.call_count = 0
-        
-        # Create Ollama client with timeout
-        try:
-            self.client = OllamaClient(
-                host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-                timeout=self.config.per_attempt_timeout_seconds
-            )
-        except Exception as e:
-            logger.warning(f"Failed to create Ollama client with timeout: {e}, using default")
-            self.client = None
-        
+        self._call_count_lock = threading.Lock()
+        self._host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        self.client = self._build_client(self.config.per_attempt_timeout_seconds)
+
         logger.info(
             f"LLMWrapper initialized with model: {self.config.model_name}, "
             f"timeout: {self.config.per_attempt_timeout_seconds}s, "
             f"num_ctx: {self.config.num_ctx}, num_predict: {self.config.num_predict}"
         )
+
+    def _build_client(self, timeout_seconds: float) -> Any:
+        """Create an OllamaClient bound to an explicit finite transport timeout."""
+        bounded_timeout = max(0.001, float(timeout_seconds))
+        return OllamaClient(
+            host=self._host,
+            timeout=httpx.Timeout(bounded_timeout),
+        )
+
+    def _get_attempt_client(self, attempt_timeout: float) -> Tuple[Any, bool]:
+        """Return (client, should_close) enforcing attempt_timeout without mutating shared client."""
+        if self.client is None:
+            return self._build_client(attempt_timeout), True
+
+        is_managed_client = isinstance(self.client, _REAL_OLLAMA_CLIENT) or (
+            isinstance(OllamaClient, type) and isinstance(self.client, OllamaClient)
+        )
+        if not is_managed_client:
+            # Test fakes/spies injected onto llm.client are used directly.
+            return self.client, False
+
+        if attempt_timeout < self.config.per_attempt_timeout_seconds:
+            # Use a request-scoped client so shared self.client timeout state is never mutated.
+            return self._build_client(attempt_timeout), True
+
+        return self.client, False
+
+    @staticmethod
+    def _close_client(client: Any) -> None:
+        """Close a request-scoped OllamaClient's underlying httpx client safely."""
+        for target in (getattr(client, "_client", None), client):
+            close_fn = getattr(target, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                    return
+                except Exception:
+                    pass
     
     def call(
         self,
@@ -111,6 +156,14 @@ class LLMWrapper:
     ) -> LLMResponse:
         """
         Call LLM with retries and validation.
+
+        Timeout semantics:
+        - Before each attempt, remaining ``total_timeout_seconds`` is checked and used
+          to cap ``attempt_timeout = min(per_attempt_timeout_seconds, remaining_total)``.
+        - Each attempt uses a bounded ``httpx.Timeout(attempt_timeout)`` transport
+          inactivity timeout (connect/read/write/pool). A synchronous response that
+          continuously makes progress without triggering transport inactivity is not
+          force-cancelled mid-request, though any subsequent retry checks the total budget.
         
         Args:
             prompt: The user prompt
@@ -124,14 +177,16 @@ class LLMWrapper:
 
         Raises:
             LLMConnectionError: Ollama is unreachable.
-            LLMTimeoutError: a request or total timeout was exceeded.
+            LLMTimeoutError: a transport timeout or inter-attempt total budget was exceeded.
             LLMResponseError: all response parsing or validation attempts failed.
             LLMError: Ollama returned an unsuccessful provider response.
         """
-        self.call_count += 1
-        overall_start_time = time.time()
+        with self._call_count_lock:
+            self.call_count += 1
+            call_num = self.call_count
+        overall_start_time = time.monotonic()
         
-        logger.info(f"LLM call #{self.call_count} starting...")
+        logger.info(f"LLM call #{call_num} starting...")
         logger.debug(f"Prompt: {prompt[:200]}...")
         
         last_error = None
@@ -140,9 +195,9 @@ class LLMWrapper:
         
         for attempt in range(self.config.max_retries + 1):  # max_retries + initial attempt
             # Check total timeout
-            elapsed = time.time() - overall_start_time
+            elapsed = time.monotonic() - overall_start_time
             if elapsed >= self.config.total_timeout_seconds:
-                duration = time.time() - overall_start_time
+                duration = time.monotonic() - overall_start_time
                 error_msg = (
                     f"LLM call exceeded total timeout of {self.config.total_timeout_seconds}s "
                     f"after {attempt} attempt(s). Total time: {duration:.2f}s"
@@ -155,7 +210,7 @@ class LLMWrapper:
             attempt_timeout = min(self.config.per_attempt_timeout_seconds, remaining_total)
             
             if attempt_timeout <= 0:
-                duration = time.time() - overall_start_time
+                duration = time.monotonic() - overall_start_time
                 error_msg = (
                     f"LLM call exceeded total timeout of {self.config.total_timeout_seconds}s "
                     f"before attempt {attempt + 1}. Total time: {duration:.2f}s"
@@ -163,7 +218,7 @@ class LLMWrapper:
                 logger.error(error_msg)
                 raise LLMTimeoutError(error_msg)
             
-            attempt_start = time.time()
+            attempt_start = time.monotonic()
             
             try:
                 # Build messages
@@ -186,11 +241,10 @@ class LLMWrapper:
                 logger.debug(f"Attempt {attempt + 1}/{self.config.max_retries + 1}")
                 
                 try:
-                    # Use client with timeout if available, otherwise fall back
-                    call_start = time.time()
-                    
-                    if self.client:
-                        response = self.client.chat(
+                    call_start = time.monotonic()
+                    attempt_client, should_close = self._get_attempt_client(attempt_timeout)
+                    try:
+                        response = attempt_client.chat(
                             model=self.config.model_name,
                             messages=messages,
                             format='json' if force_json else None,
@@ -202,35 +256,27 @@ class LLMWrapper:
                             },
                             keep_alive=self.config.keep_alive
                         )
-                    else:
-                        response = ollama.chat(
-                            model=self.config.model_name,
-                            messages=messages,
-                            format='json' if force_json else None,
-                            options={
-                                'temperature': self.config.temperature,
-                                'top_p': self.config.top_p,
-                                'num_predict': self.config.num_predict,
-                                'num_ctx': self.config.num_ctx
-                            },
-                            keep_alive=self.config.keep_alive
-                        )
-                    
-                    call_duration = time.time() - call_start
-                    
+                    finally:
+                        if should_close:
+                            self._close_client(attempt_client)
+
+                    call_duration = time.monotonic() - call_start
+
                     # Check if this single call exceeded the per-attempt timeout
                     if call_duration > attempt_timeout:
-                        logger.warning(f"Call took {call_duration:.2f}s, exceeded attempt timeout of {attempt_timeout:.2f}s")
-                        
+                        logger.warning(
+                            f"Call took {call_duration:.2f}s, exceeded attempt timeout of {attempt_timeout:.2f}s"
+                        )
+
                 except (httpx.TimeoutException, TimeoutError) as e:
                     error_msg = (
-                        f"Ollama request timed out after {time.time() - overall_start_time:.2f}s. "
+                        f"Ollama request timed out after {time.monotonic() - overall_start_time:.2f}s. "
                         f"Error: {e}"
                     )
                     logger.error(error_msg)
                     raise LLMTimeoutError(error_msg) from e
                 except (ConnectionError, httpx.TransportError) as e:
-                    duration = time.time() - overall_start_time
+                    duration = time.monotonic() - overall_start_time
                     error_msg = (
                         f"Cannot connect to Ollama service after {duration:.2f}s. "
                         f"Please ensure Ollama is running (ollama serve). "
@@ -270,7 +316,7 @@ class LLMWrapper:
                         break
                     continue
                 self._log_ollama_stats(response)
-                attempt_duration = time.time() - attempt_start
+                attempt_duration = time.monotonic() - attempt_start
                 logger.debug(f"Attempt {attempt + 1} completed in {attempt_duration:.2f}s")
                 logger.debug(f"Raw response: {raw_text[:200]}...")
                 
@@ -314,7 +360,7 @@ class LLMWrapper:
                         continue
                 
                 # Success!
-                duration = time.time() - overall_start_time
+                duration = time.monotonic() - overall_start_time
                 logger.info(f"✅ LLM call succeeded in {duration:.2f}s (attempt {attempt + 1})")
                 
                 return LLMResponse(
@@ -330,7 +376,7 @@ class LLMWrapper:
                 raise
         
         # All attempts exhausted
-        duration = time.time() - overall_start_time
+        duration = time.monotonic() - overall_start_time
         error_msg = (
             f"LLM call failed after {self.config.max_retries + 1} attempt(s) "
             f"in {duration:.2f}s. Last error: {last_error}"
@@ -362,11 +408,13 @@ class LLMWrapper:
     
     def get_call_count(self) -> int:
         """Get total number of LLM calls made."""
-        return self.call_count
+        with self._call_count_lock:
+            return self.call_count
     
     def reset_call_count(self):
         """Reset call counter."""
-        self.call_count = 0
+        with self._call_count_lock:
+            self.call_count = 0
 
 
 # Global singleton instance

@@ -1,6 +1,6 @@
 # DataSmith AI - Intelligent Dataset Generation Platform
 
-**Status**: Phase 1 Complete ✅ - Requirement Analyzer Done
+**Status**: Phase 2 Complete ✅ - Requirement Analysis and Planning
 
 ---
 
@@ -20,7 +20,9 @@ Phase 0 provides the infrastructure, and Phase 1 adds the Requirement Analyzer.
 ```
 DatasmithAI/
 ├── agents/
-│   └── requirement_analyzer.py
+│   ├── requirement_analyzer.py
+│   ├── planning_agent.py   # Source and search planning
+│   └── source_catalog.py   # Editable provider hints
 ├── core/                    # Phase 0 foundations
 │   ├── __init__.py
 │   ├── dataset_spec.py      # Data contract
@@ -32,7 +34,8 @@ DatasmithAI/
 │   ├── __init__.py
 │   ├── test_dataset_spec.py
 │   ├── test_llm_wrapper.py
-│   └── test_orchestrator.py
+│   ├── test_orchestrator.py
+│   └── test_planning_agent.py
 ├── venv/                    # Virtual environment
 ├── .gitignore
 ├── requirements.txt
@@ -74,7 +77,7 @@ python -m pytest tests/ -v
 python -m pytest tests/test_dataset_spec.py -v
 ```
 
-**Real suite count**: 257 tests passing, 13 skipped without Ollama
+**Real suite count**: 446 tests passing, 13 skipped without Ollama
 
 ---
 
@@ -113,6 +116,14 @@ python -m pytest tests/test_dataset_spec.py -v
 - Writes clarification questions and provenance to the dataset spec
 
 Future agents will follow the same pattern.
+
+## Phase 2
+
+### Planning Agent — DONE
+- Selects source types and search queries from the editable `agents/source_catalog.py` hints
+- Applies geography, time, feature, and access constraints to the candidate sources
+- Produces a plan only; it does not invent source URLs or retrieve data
+- Uses the LLM only for optional search-query and reasoning refinement
 
 ---
 

@@ -18,6 +18,7 @@ from pydantic import (
 import uuid
 import re
 from pathlib import PurePosixPath
+from urllib.parse import parse_qsl, urlsplit
 from typing import List, Dict, Any, Optional, Literal, Callable
 from datetime import datetime, timezone
 from enum import Enum
@@ -178,11 +179,43 @@ LicenseConditionsStatus = Literal["satisfied", "unsatisfied", "unknown"]
 ConnectorAssessmentStatus = Literal[
     "unknown",
     "not_implemented",
+    "not_required",
     "planned",
     "implemented_untested",
     "implemented_tested",
     "unsupported",
 ]
+BlockedFetchReasonCode = Literal[
+    "allowlist_blocked",
+    "ssrf_blocked",
+    "scheme_blocked",
+    "redirect_blocked",
+    "timeout",
+    "too_large",
+    "bad_content_type",
+    "http_error",
+    "network_error",
+    "budget_exhausted",
+]
+BlockedFetchStage = Literal[
+    "pre_request_policy",
+    "pre_request_dns",
+    "redirect_validation",
+    "network_request",
+]
+TemporalClaimType = Literal["documented", "observed"]
+ProviderDiscoveryStatus = Literal[
+    "results",
+    "empty",
+    "error",
+    "invalid_response",
+    "not_configured",
+]
+
+DEFAULT_FRESHNESS_MAX_AGE_HOURS: Dict[str, int] = {
+    "live": 1,
+    "recent": 24,
+}
 
 
 # ============================================================================
@@ -214,7 +247,11 @@ class RequirementSpec(SpecModel):
         description="How fresh the data needs to be"
     )
     max_data_age: Optional[str] = Field(None, description="Maximum data age (e.g., '24 hours', '7 days')")
-    max_data_age_hours: Optional[int] = Field(None, description="max_data_age as hours (live=1, recent=24)")
+    max_data_age_hours: Optional[int] = Field(
+        None,
+        ge=1,
+        description="max_data_age as integer hours >= 1 (live=1, recent=24)",
+    )
     requested_update_frequency: Optional[str] = Field(
         None,
         description="Explicit user requirement for how often source data is updated",
@@ -632,10 +669,43 @@ class PlanSpec(SpecModel):
         ),
     )
 
+    # ---- Increment 4.0 additions (backward-compatible defaults) ----
+    retrieval_instructions: List["RetrievalInstruction"] = Field(
+        default_factory=list,
+        description=(
+            "Executable retrieval instructions for the selected primary candidate. "
+            "At most one instruction is emitted per plan."
+        ),
+    )
+    blocked_fetches: List["BlockedFetchRecord"] = Field(
+        default_factory=list,
+        description="Urls blocked or failed during discovery/evidence capture.",
+    )
+    provider_statuses: Dict[StrictStr, ProviderDiscoveryStatus] = Field(
+        default_factory=dict,
+        description="Per-provider discovery outcome status.",
+    )
+
 
 # ============================================================================
 # SOURCE RESEARCH AND EVIDENCE
 # ============================================================================
+
+def _validate_safe_relative_path(value: str, field_name: str = "relative_path") -> str:
+    """Validate and normalize a relative artifact path (prevents traversal/absolute paths)."""
+    normalized = value.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if (
+        not normalized
+        or "\x00" in normalized
+        or path.is_absolute()
+        or re.match(r"^[a-zA-Z]:", normalized)
+        or ".." in path.parts
+        or not path.parts
+    ):
+        raise ValueError(f"{field_name} must be a safe relative path")
+    return path.as_posix()
+
 
 class SourceEvidence(SpecModel):
     """Traceable, application-collected material that may support a finding.
@@ -754,10 +824,24 @@ class SourceEvidence(SpecModel):
         pattern=r"^[a-fA-F0-9]{64}$",
         description=(
             "Hex-encoded SHA-256 digest of the captured content, when computed by the "
-            "collecting code at capture time.  Presence indicates the content was hashed "
-            "at capture; it does not prove authenticity or integrity against tampering."
+            "collecting code at capture time.  When artifact_relative_path is set, this "
+            "hashes the exact UTF-8 bytes of that artifact file."
         ),
     )
+    artifact_relative_path: Optional[StrictStr] = Field(
+        None,
+        description=(
+            "Safe path relative to the run's artifact directory pointing to the full "
+            "captured UTF-8 text artifact."
+        ),
+    )
+
+    @field_validator("artifact_relative_path")
+    @classmethod
+    def validate_artifact_relative_path(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return _validate_safe_relative_path(value, "artifact_relative_path")
 
     @field_validator("title")
     @classmethod
@@ -798,6 +882,13 @@ class SourceFinding(SpecModel):
     dimension: EvaluationDimension
     claim: StrictStr = Field(..., min_length=1)
     value: Optional[Dict[str, Any]] = None
+    claim_type: Optional[TemporalClaimType] = Field(
+        None,
+        description=(
+            "For temporal_coverage and freshness findings: 'documented' for source "
+            "claims vs 'observed' for parsed timestamped records."
+        ),
+    )
     evidence_ids: List[UUID] = Field(default_factory=list)
     confidence: float = Field(0.0, ge=0.0, le=1.0)
     status: EvidenceStatus
@@ -1109,6 +1200,15 @@ class CandidateSource(SpecModel):
             "deferred because it lacks a connector even when fully evaluated."
         ),
     )
+    fallback_rank: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Ranked fallback order (1=next best) when selection_status='deferred'.",
+    )
+    selection_reason: Optional[StrictStr] = Field(
+        None,
+        description="Human-readable rationale for selection, ranked deferral, or rejection.",
+    )
 
     @field_validator("title")
     @classmethod
@@ -1118,7 +1218,14 @@ class CandidateSource(SpecModel):
             raise ValueError("candidate title must not be blank")
         return value
 
-    @field_validator("publisher", "description", "source_type", "source_category", "discovery_query")
+    @field_validator(
+        "publisher",
+        "description",
+        "source_type",
+        "source_category",
+        "discovery_query",
+        "selection_reason",
+    )
     @classmethod
     def validate_optional_text(cls, value: Optional[str]) -> Optional[str]:
         if value is not None:
@@ -1547,8 +1654,16 @@ class CandidateSource(SpecModel):
             validate_assessment_findings(
                 assessment.connector.finding_ids,
                 "connector",
-                assessment.connector.status != "unknown",
+                assessment.connector.status not in {"unknown", "not_required"},
             )
+            if assessment.connector.status == "not_required":
+                for finding_id in assessment.connector.finding_ids:
+                    finding = findings_by_id[finding_id]
+                    if finding.status == "unknown" or not finding.evidence_ids:
+                        raise ValueError(
+                            "not_required connector assessment requires evidence-backed "
+                            "connector findings"
+                        )
 
             assessed_dimensions = set(assessment.findings_by_dimension)
             required_dimensions = set(assessment.required_dimensions)
@@ -1562,6 +1677,220 @@ class CandidateSource(SpecModel):
                 )
             if self.evaluation_status == "partial" and not assessed_dimensions:
                 raise ValueError("partial evaluation requires at least one assessed dimension")
+        if self.fallback_rank is not None and self.selection_status != "deferred":
+            raise ValueError("fallback_rank may only be set when selection_status='deferred'")
+        return self
+
+
+_SENSITIVE_QUERY_KEYS = frozenset({
+    "api_key",
+    "apikey",
+    "access_token",
+    "auth_token",
+    "token",
+    "secret",
+    "client_secret",
+    "password",
+    "passwd",
+    "subscription_key",
+    "subscription-key",
+})
+_SENSITIVE_HEADER_KEYS = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+})
+
+
+class BlockedFetchRecord(SpecModel):
+    """Audit record for a URL blocked pre-request or failed during discovery/evidence capture."""
+
+    url: AnyHttpUrl
+    candidate_id: Optional[UUID] = None
+    reason_code: BlockedFetchReasonCode
+    network_attempted: bool = Field(
+        ...,
+        description=(
+            "Whether a network request was actually attempted to this specific URL "
+            "(False if blocked pre-connection, including a blocked redirect destination)."
+        ),
+    )
+    block_stage: BlockedFetchStage
+    detail: StrictStr = Field(..., min_length=1)
+    recorded_at: datetime
+    redirect_chain: List[StrictStr] = Field(default_factory=list)
+
+    @field_validator("detail")
+    @classmethod
+    def validate_detail(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("detail must not be blank")
+        return value
+
+    @field_validator("redirect_chain")
+    @classmethod
+    def validate_redirect_chain(cls, values: List[str]) -> List[str]:
+        cleaned = []
+        for item in values:
+            stripped = item.strip()
+            if not stripped:
+                raise ValueError("redirect_chain entries must not be blank")
+            cleaned.append(stripped)
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_stage_consistency(self):
+        if self.block_stage in {"pre_request_policy", "pre_request_dns"} and self.network_attempted:
+            raise ValueError(
+                f"network_attempted must be False for block_stage='{self.block_stage}'"
+            )
+        if self.block_stage == "redirect_validation" and self.network_attempted:
+            raise ValueError(
+                "network_attempted must be False when a redirect destination is blocked before connection"
+            )
+        return self
+
+
+class RetrievalInstruction(SpecModel):
+    """Executable, secret-free retrieval handoff for the single selected primary candidate."""
+
+    instruction_id: UUID = Field(default_factory=uuid.uuid4)
+    candidate_id: UUID
+    source_url: AnyHttpUrl
+    retrieval_method: Literal["direct_download", "http_api"]
+    http_method: Literal["GET"] = "GET"
+    query_params: Dict[StrictStr, StrictStr] = Field(default_factory=dict)
+    headers: Dict[StrictStr, StrictStr] = Field(default_factory=dict)
+    expected_format: StrictStr = Field(..., min_length=1)
+    parser_hint: StrictStr = Field(..., min_length=1)
+    access_class: Literal["free", "free_with_registration", "free_tier"]
+    authentication_requirement: Literal["none", "free_registration", "api_key"]
+    credential_env_var: Optional[StrictStr] = None
+    credential_location: Optional[Literal["header", "query_param"]] = None
+    credential_field_name: Optional[StrictStr] = None
+    license_spdx_id: Optional[StrictStr] = None
+    license_conditions_by_right: Dict[UsageRight, StrictStr] = Field(default_factory=dict)
+    requires_runtime_freshness_verification: bool = False
+    max_data_age_hours: Optional[int] = Field(None, ge=1)
+    rate_limit_rpm: Optional[int] = Field(None, ge=1)
+    max_bytes: int = Field(50_000_000, ge=1)
+    pagination_mode: Literal["single_request"] = "single_request"
+    rationale: StrictStr = Field(..., min_length=1)
+    evidence_ids: List[UUID] = Field(..., min_length=1)
+
+    @field_validator(
+        "expected_format",
+        "parser_hint",
+        "rationale",
+    )
+    @classmethod
+    def validate_required_nonblank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("required string field must not be blank")
+        return value
+
+    @field_validator("credential_env_var", "credential_field_name", "license_spdx_id")
+    @classmethod
+    def validate_optional_nonblank(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None:
+            value = value.strip()
+            if not value:
+                raise ValueError("optional string field must not be blank when provided")
+        return value
+
+    @field_validator("license_conditions_by_right")
+    @classmethod
+    def validate_license_conditions(
+        cls, value: Dict[UsageRight, str]
+    ) -> Dict[UsageRight, str]:
+        cleaned: Dict[UsageRight, str] = {}
+        for right, text in value.items():
+            stripped = text.strip()
+            if not stripped:
+                raise ValueError(
+                    f"license condition for right '{right}' must not be blank"
+                )
+            cleaned[right] = stripped
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_instruction(self):
+        parsed = urlsplit(str(self.source_url))
+        if parsed.scheme.lower() != "https":
+            raise ValueError("RetrievalInstruction.source_url must use https")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("RetrievalInstruction.source_url must not contain credentials")
+        for key, val in parse_qsl(parsed.query, keep_blank_values=True):
+            if key.strip().lower() in _SENSITIVE_QUERY_KEYS and val.strip():
+                raise ValueError(
+                    f"RetrievalInstruction.source_url must not embed credential parameter '{key}'"
+                )
+
+        fixed_query_keys = {
+            key.strip().lower()
+            for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.strip()
+        }
+        for key in self.query_params:
+            lowered_key = key.strip().lower()
+            if lowered_key in _SENSITIVE_QUERY_KEYS:
+                raise ValueError(
+                    f"Credentials must use credential_env_var, not query_params['{key}']"
+                )
+            if lowered_key in fixed_query_keys:
+                raise ValueError(
+                    f"query_params['{key}'] must not duplicate or override fixed "
+                    "query parameters in source_url"
+                )
+        for key in self.headers:
+            if key.strip().lower() in _SENSITIVE_HEADER_KEYS:
+                raise ValueError(
+                    f"Credentials or cookies must not be stored in headers['{key}']"
+                )
+
+        cred_tuple = (
+            self.credential_env_var,
+            self.credential_location,
+            self.credential_field_name,
+        )
+        any_cred = any(item is not None for item in cred_tuple)
+        all_cred = all(item is not None for item in cred_tuple)
+        if any_cred and not all_cred:
+            raise ValueError(
+                "credential_env_var, credential_location, and credential_field_name "
+                "must all be provided together"
+            )
+        if self.authentication_requirement == "none" and any_cred:
+            raise ValueError(
+                "credential_env_var must not be set when authentication_requirement='none'"
+            )
+        if self.authentication_requirement == "api_key" and not all_cred:
+            raise ValueError(
+                "authentication_requirement='api_key' requires credential_env_var, "
+                "credential_location, and credential_field_name"
+            )
+        if self.credential_env_var is not None and not re.fullmatch(
+            r"[A-Z][A-Z0-9_]*", self.credential_env_var
+        ):
+            raise ValueError(
+                "credential_env_var must be an uppercase environment variable name"
+            )
+
+        if self.requires_runtime_freshness_verification and self.max_data_age_hours is None:
+            raise ValueError(
+                "requires_runtime_freshness_verification=True requires max_data_age_hours"
+            )
+        if not self.requires_runtime_freshness_verification and self.max_data_age_hours is not None:
+            raise ValueError(
+                "max_data_age_hours may only be set when requires_runtime_freshness_verification=True"
+            )
+        if len(self.evidence_ids) != len(set(self.evidence_ids)):
+            raise ValueError("RetrievalInstruction.evidence_ids must be unique")
         return self
 
 
@@ -1636,18 +1965,7 @@ class DownloadedArtifact(SpecModel):
     @field_validator("relative_path")
     @classmethod
     def validate_relative_path(cls, value: str) -> str:
-        normalized = value.replace("\\", "/")
-        path = PurePosixPath(normalized)
-        if (
-            not normalized
-            or "\x00" in normalized
-            or path.is_absolute()
-            or re.match(r"^[a-zA-Z]:", normalized)
-            or ".." in path.parts
-            or not path.parts
-        ):
-            raise ValueError("relative_path must be a safe relative path")
-        return path.as_posix()
+        return _validate_safe_relative_path(value, "relative_path")
 
 
 class FailedSource(SpecModel):
@@ -1759,6 +2077,171 @@ class AgentExecution(SpecModel):
 # MAIN DATASET SPECIFICATION
 # ============================================================================
 
+def _normalize_endpoint_url(url: str) -> str:
+    """Normalize an endpoint URL for deterministic equality/exclusion checks."""
+    parts = urlsplit(url.strip())
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    path = parts.path.rstrip("/") or "/"
+    query = "&".join(f"{k}={v}" for k, v in sorted(parse_qsl(parts.query, keep_blank_values=True)))
+    return f"{scheme}://{netloc}{path}" + (f"?{query}" if query else "")
+
+
+def _endpoints_match(instruction_url: str, documented_endpoint_url: str) -> bool:
+    """True when instruction_url matches an explicitly verified documented endpoint.
+
+    Both URLs must use HTTPS, match on host and normalized path, and carry the
+    exact same fixed query parameters (an undocumented URL query string is
+    rejected; ordinary request filters belong in RetrievalInstruction.query_params).
+    """
+    iu = urlsplit(instruction_url.strip())
+    ep = urlsplit(documented_endpoint_url.strip())
+    if iu.scheme.lower() != "https" or ep.scheme.lower() != "https":
+        return False
+    if iu.netloc.lower() != ep.netloc.lower():
+        return False
+    if (iu.path.rstrip("/") or "/") != (ep.path.rstrip("/") or "/"):
+        return False
+    return sorted(parse_qsl(iu.query, keep_blank_values=True)) == sorted(
+        parse_qsl(ep.query, keep_blank_values=True)
+    )
+
+
+_TEXTUAL_AGE_RE = re.compile(
+    r"^\s*(?:within\s+|max\s+|last\s+)?(-?\d+)\s*"
+    r"(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_textual_age_hours(text: str) -> tuple[Optional[int], Optional[str]]:
+    """Parse an unambiguous textual max_data_age into positive integer hours."""
+    cleaned = " ".join(text.strip().split())
+    if not cleaned:
+        return None, "max_data_age is blank; clarification is required"
+
+    match = _TEXTUAL_AGE_RE.match(cleaned)
+    if not match:
+        return (
+            None,
+            f"max_data_age='{text}' is ambiguous or unsupported; clarification is required",
+        )
+
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    if amount <= 0:
+        return None, f"max_data_age='{text}' must be at least 1 hour"
+
+    if unit.startswith("h"):
+        return amount, None
+    if unit.startswith("d"):
+        return amount * 24, None
+    if unit.startswith("w"):
+        return amount * 24 * 7, None
+    if unit.startswith("m"):
+        if amount % 60 == 0 and amount >= 60:
+            return amount // 60, None
+        return (
+            None,
+            f"max_data_age='{text}' requires sub-hour or non-integer precision that "
+            "cannot be represented accurately in integer hours; clarification is required",
+        )
+    if unit.startswith("s"):
+        if amount % 3600 == 0 and amount >= 3600:
+            return amount // 3600, None
+        return (
+            None,
+            f"max_data_age='{text}' requires sub-hour or non-integer precision that "
+            "cannot be represented accurately in integer hours; clarification is required",
+        )
+    return None, f"max_data_age='{text}' is unsupported; clarification is required"
+
+
+def resolve_freshness_threshold_hours(
+    requirement: RequirementSpec,
+) -> tuple[Optional[int], Optional[str]]:
+    """Resolve the numeric freshness threshold in hours without guessing or ignoring conflicts."""
+    numeric_hours = requirement.max_data_age_hours
+    if numeric_hours is not None and numeric_hours < 1:
+        return None, f"max_data_age_hours ({numeric_hours}) must be at least 1 hour"
+
+    text_age = (requirement.max_data_age or "").strip()
+    if text_age:
+        parsed_hours, parse_err = _parse_textual_age_hours(text_age)
+        if numeric_hours is not None:
+            if parse_err is not None or parsed_hours != numeric_hours:
+                return (
+                    None,
+                    f"Conflicting freshness thresholds: max_data_age='{text_age}' "
+                    f"disagrees with max_data_age_hours={numeric_hours}",
+                )
+            return numeric_hours, None
+        return parsed_hours, parse_err
+
+    if numeric_hours is not None:
+        return numeric_hours, None
+
+    default_hours = DEFAULT_FRESHNESS_MAX_AGE_HOURS.get(requirement.freshness_need)
+    if default_hours is not None:
+        return default_hours, None
+    return None, None
+
+
+class ReplanAttempt(SpecModel):
+    """Audit record of one Orchestrator-triggered bounded replanning attempt."""
+
+    attempt_number: int = Field(..., ge=1, le=2)
+    triggered_at: datetime
+    reason: StrictStr = Field(..., min_length=1)
+    failed_candidate_id: Optional[UUID] = None
+    failed_endpoint_url: Optional[AnyHttpUrl] = None
+    excluded_candidate_ids: List[UUID] = Field(default_factory=list)
+    excluded_urls: List[StrictStr] = Field(default_factory=list)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("ReplanAttempt.reason must not be blank")
+        return value
+
+    @field_validator("excluded_urls")
+    @classmethod
+    def validate_excluded_urls(cls, values: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        for item in values:
+            stripped = item.strip()
+            if not stripped:
+                raise ValueError("excluded_urls entries must not be blank")
+            cleaned.append(stripped)
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_attempt(self):
+        if len(self.excluded_candidate_ids) != len(set(self.excluded_candidate_ids)):
+            raise ValueError("excluded_candidate_ids must be unique")
+        if not self.excluded_candidate_ids and not self.excluded_urls:
+            raise ValueError(
+                "ReplanAttempt must exclude at least one candidate ID or endpoint URL"
+            )
+        if (
+            self.failed_candidate_id is not None
+            and self.failed_candidate_id not in self.excluded_candidate_ids
+        ):
+            raise ValueError(
+                "failed_candidate_id must be included in excluded_candidate_ids"
+            )
+        if self.failed_endpoint_url is not None:
+            norm_failed = _normalize_endpoint_url(str(self.failed_endpoint_url))
+            norm_excluded = {_normalize_endpoint_url(u) for u in self.excluded_urls}
+            if norm_failed not in norm_excluded:
+                raise ValueError(
+                    "failed_endpoint_url must be included in excluded_urls"
+                )
+        return self
+
+
 class DatasetSpec(SpecModel):
     """
     Complete dataset specification.
@@ -1787,6 +2270,8 @@ class DatasetSpec(SpecModel):
     
     # Execution history
     execution_history: List[AgentExecution] = Field(default_factory=list, description="All agent executions")
+    replan_count: int = Field(0, ge=0, le=2, description="Orchestrator-owned replanning counter (max 2)")
+    replan_history: List[ReplanAttempt] = Field(default_factory=list, description="Bounded replanning audit trail")
     
     # Warnings and errors
     warnings: List[str] = Field(default_factory=list, description="Non-fatal warnings")
@@ -1828,6 +2313,512 @@ class DatasetSpec(SpecModel):
 # VALIDATION HELPERS
 # ============================================================================
 
+def _validate_plan_invariants(spec: DatasetSpec, errors: List[str]) -> None:
+    """Validate Increment 4 planning, selection, instruction, and provenance invariants."""
+    plan = spec.plan
+    if plan is None:
+        return
+
+    source_types = {source.source_type for source in plan.source_requirements}
+    source_priorities = [source.priority for source in plan.source_requirements]
+    query_priorities = [query.priority for query in plan.search_queries]
+    if len(source_priorities) != len(set(source_priorities)):
+        errors.append("Plan source requirement priorities must be unique")
+    if len(query_priorities) != len(set(query_priorities)):
+        errors.append("Plan search query priorities must be unique")
+    for query in plan.search_queries:
+        if query.related_source_type not in source_types:
+            errors.append(
+                f"Search query source type '{query.related_source_type}' "
+                "does not match a source requirement"
+            )
+
+    candidates_by_id = {c.candidate_id: c for c in plan.candidate_sources}
+    if len(candidates_by_id) != len(plan.candidate_sources):
+        errors.append("Plan candidate_sources must have unique candidate_id values")
+
+    # 1. Selection and retrieval-instruction cardinality
+    selected = [c for c in plan.candidate_sources if c.selection_status == "selected"]
+    if len(selected) > 1:
+        errors.append("At most one CandidateSource may have selection_status='selected'")
+    if len(plan.retrieval_instructions) > 1:
+        errors.append(
+            "PlanSpec.retrieval_instructions may contain at most one primary instruction"
+        )
+    if len(plan.retrieval_instructions) == 1 and len(selected) != 1:
+        errors.append(
+            "PlanSpec.retrieval_instructions requires exactly one selected CandidateSource"
+        )
+
+    # 2. Unique fallback ranks for deferred candidates
+    fallback_ranks = [
+        c.fallback_rank
+        for c in plan.candidate_sources
+        if c.selection_status == "deferred" and c.fallback_rank is not None
+    ]
+    if len(fallback_ranks) != len(set(fallback_ranks)):
+        errors.append("Deferred candidate fallback_rank values must be unique")
+
+    # 2b. Deferred-candidate usability: a deferred candidate is a valid
+    # fallback only while its own assessment keeps it usable.  Replan
+    # exclusion is enforced separately in _validate_replan_invariants
+    # (an excluded candidate must already be 'rejected', never 'deferred').
+    if plan.planning_policy is not None:
+        required_usage_rights: List[UsageRight] = list(
+            plan.planning_policy.usage_intent.required_rights
+        )
+    else:
+        # UsageIntent always requires the 'use' right, so a plan without an
+        # explicit policy still carries that minimum requirement.
+        required_usage_rights = ["use"]
+    for cand in plan.candidate_sources:
+        if cand.selection_status != "deferred" or cand.assessment is None:
+            continue
+        assessment = cand.assessment
+
+        # Quota: a candidate known to exceed its applicable quota limit
+        # cannot serve as a fallback; it must be rejected, not deferred.
+        if assessment.quota.status == "exceeds_limit":
+            errors.append(
+                f"Deferred candidate {cand.candidate_id} has quota.status="
+                "'exceeds_limit' and cannot be a usable fallback; it must be "
+                "selection_status='rejected'"
+            )
+
+        # License: a fully evaluated deferred fallback must establish every
+        # required usage right as allowed or conditional.  A prohibited or
+        # unknown required right makes it unusable as a fallback.
+        if cand.evaluation_status == "complete":
+            for right in required_usage_rights:
+                permission = assessment.license_permissions.get(right)
+                if permission is None or permission.status not in {"allowed", "conditional"}:
+                    errors.append(
+                        f"Deferred candidate {cand.candidate_id} does not establish "
+                        f"required usage right '{right}' as allowed or conditional; "
+                        "a fully evaluated fallback with a prohibited or unknown "
+                        "required right must be selection_status='rejected'"
+                    )
+
+        # Connector: an unsupported or not-implemented connector disqualifies
+        # a deferred fallback only when its verified retrieval_methods
+        # findings document no manual retrieval path.  When no verified
+        # retrieval finding exists, the manual path cannot be established
+        # either way and no error is raised (recorded limitation).
+        if assessment.connector.status in {"unsupported", "not_implemented"}:
+            findings_by_id = {f.finding_id: f for f in cand.findings}
+            documented_methods: set = set()
+            for fid in assessment.findings_by_dimension.get("retrieval_methods", []):
+                finding = findings_by_id.get(fid)
+                if finding is None or finding.status != "verified" or not finding.value:
+                    continue
+                methods = finding.value.get("methods")
+                if isinstance(methods, list):
+                    documented_methods.update(
+                        str(m) for m in methods if isinstance(m, str)
+                    )
+                for key in ("method", "retrieval_method"):
+                    single = finding.value.get(key)
+                    if isinstance(single, str):
+                        documented_methods.add(single)
+            if documented_methods and "manual" not in documented_methods:
+                errors.append(
+                    f"Deferred candidate {cand.candidate_id} has connector.status="
+                    f"'{assessment.connector.status}' with no documented manual "
+                    "retrieval path; it cannot serve as a usable fallback and must "
+                    "be selection_status='rejected'"
+                )
+
+    # 8. Provider-aware research-status consistency
+    # not_configured optional providers do not count as attempted or failed.
+    eval_statuses = [c.evaluation_status for c in plan.candidate_sources]
+    configured_providers = {
+        name: status
+        for name, status in plan.provider_statuses.items()
+        if status != "not_configured"
+    }
+    failed_providers = [
+        name
+        for name, status in configured_providers.items()
+        if status in {"error", "invalid_response"}
+    ]
+    has_incomplete_candidates = any(
+        s in {"not_started", "in_progress", "partial"} for s in eval_statuses
+    )
+    has_failed_candidates = any(s == "failed" for s in eval_statuses)
+    has_complete_candidates = any(s == "complete" for s in eval_statuses)
+    has_blocked_fetches = bool(plan.blocked_fetches)
+    # A potentially actionable candidate: fully evaluated and either selected
+    # or deferred for retrieval.  While such a candidate remains, a blocked
+    # primary is a recoverable setback ('partial'), never a terminal 'failed'
+    # research outcome.  Per-candidate usability (quota, license, connector)
+    # is enforced separately in section 2b above.
+    has_actionable_candidate = any(
+        c.evaluation_status == "complete" and c.selection_status in {"selected", "deferred"}
+        for c in plan.candidate_sources
+    )
+    all_configured_failed_no_results = (
+        bool(configured_providers)
+        and len(failed_providers) == len(configured_providers)
+        and not plan.candidate_sources
+    )
+    all_candidates_failed_no_results = (
+        bool(plan.candidate_sources)
+        and all(s == "failed" for s in eval_statuses)
+    )
+
+    if plan.research_status == "not_started":
+        if (
+            plan.candidate_sources
+            or plan.retrieval_instructions
+            or plan.blocked_fetches
+            or configured_providers
+        ):
+            errors.append(
+                "PlanSpec with research_status='not_started' must not contain "
+                "candidate_sources, retrieval_instructions, blocked_fetches, or "
+                "configured provider results"
+            )
+    elif plan.research_status == "complete":
+        if not configured_providers:
+            errors.append(
+                "PlanSpec with research_status='complete' requires at least one "
+                "configured discovery provider result"
+            )
+        if failed_providers:
+            errors.append(
+                "PlanSpec with research_status='complete' cannot have failed providers"
+            )
+        if has_blocked_fetches:
+            errors.append(
+                "PlanSpec with research_status='complete' cannot contain blocked "
+                "fetches; a blocked fetch is a recoverable failure, not a "
+                "completed research run"
+            )
+        if has_incomplete_candidates or has_failed_candidates:
+            errors.append(
+                "PlanSpec with research_status='complete' cannot contain "
+                "not_started, in_progress, partial, or failed candidates"
+            )
+    elif plan.research_status == "partial":
+        # A blocked fetch alone keeps research recoverable only while a
+        # potentially actionable candidate remains.  With no actionable
+        # candidate, no failed provider, and no failed candidate, a blocked
+        # primary with no usable fallback is a terminal failure.
+        has_recoverable_failure_or_progress = (
+            bool(failed_providers)
+            or has_incomplete_candidates
+            or has_failed_candidates
+            or (has_blocked_fetches and has_actionable_candidate)
+        )
+        if not has_recoverable_failure_or_progress:
+            errors.append(
+                "PlanSpec with research_status='partial' requires a recoverable "
+                "provider or candidate-level failure, an incomplete candidate "
+                "evaluation, or a blocked fetch while a selected or deferred "
+                "candidate remains actionable"
+            )
+        elif all_configured_failed_no_results or all_candidates_failed_no_results:
+            errors.append(
+                "PlanSpec with research_status='partial' is invalid when all "
+                "configured providers or all candidates failed with no usable results"
+            )
+    elif plan.research_status == "failed":
+        if plan.retrieval_instructions:
+            errors.append(
+                "PlanSpec with research_status='failed' must not contain retrieval_instructions"
+            )
+        if has_actionable_candidate:
+            errors.append(
+                "PlanSpec with research_status='failed' cannot contain a fully "
+                "evaluated selected or deferred candidate; a plan with a valid "
+                "selected or deferred candidate remains actionable and must not "
+                "be classified as failed"
+            )
+        elif has_incomplete_candidates:
+            errors.append(
+                "PlanSpec with research_status='failed' cannot contain "
+                "not_started, in_progress, or partial candidates; research is "
+                "not terminal while a candidate evaluation is still underway"
+            )
+        else:
+            # A terminal 'failed' outcome requires a total failure: every
+            # configured provider failed with no candidates, every discovered
+            # candidate failed evaluation, a blocked fetch as the sole failure
+            # with no actionable candidate, or a fatal pipeline failure.
+            blocked_with_no_usable_path = (
+                has_blocked_fetches
+                and not failed_providers
+                and not has_failed_candidates
+            )
+            fatal_pipeline_failure = (
+                spec.pipeline_status == PipelineStatus.FAILED
+                or bool(spec.errors)
+            )
+            if not (
+                all_configured_failed_no_results
+                or all_candidates_failed_no_results
+                or blocked_with_no_usable_path
+                or fatal_pipeline_failure
+            ):
+                errors.append(
+                    "PlanSpec with research_status='failed' requires a total "
+                    "failure: every configured provider failed with no candidates, "
+                    "every discovered candidate failed evaluation, a blocked fetch "
+                    "with no actionable candidate and no other recoverable failure, "
+                    "or a fatal pipeline failure with no usable research result "
+                    "(not_configured alone is not a failure)"
+                )
+
+    # 9. Blocked-fetch candidate references
+    for blocked in plan.blocked_fetches:
+        if blocked.candidate_id is not None and blocked.candidate_id not in candidates_by_id:
+            errors.append(
+                f"BlockedFetchRecord references unknown candidate_id '{blocked.candidate_id}'"
+            )
+
+    # 7b. Claim-type validation on evaluated temporal/freshness findings
+    if plan.research_status != "not_started":
+        for cand in plan.candidate_sources:
+            ev_map = {e.evidence_id: e for e in cand.evidence}
+            for finding in cand.findings:
+                if finding.dimension in {"temporal_coverage", "freshness"} and finding.status != "unknown":
+                    if finding.claim_type not in {"documented", "observed"}:
+                        errors.append(
+                            f"Candidate {cand.candidate_id} {finding.dimension} finding "
+                            f"{finding.finding_id} must specify claim_type ('documented' or 'observed')"
+                        )
+                    elif finding.claim_type == "observed":
+                        has_observed = any(
+                            ev_map[eid].evidence_type == "observed_response"
+                            and ev_map[eid].capture_method == "observed_response"
+                            for eid in finding.evidence_ids
+                            if eid in ev_map
+                        )
+                        if not has_observed:
+                            errors.append(
+                                f"Candidate {cand.candidate_id} observed {finding.dimension} "
+                                "finding requires observed_response evidence"
+                            )
+
+    if not plan.retrieval_instructions:
+        return
+
+    instr = plan.retrieval_instructions[0]
+    if len(selected) != 1:
+        return
+    primary = selected[0]
+
+    # 3. Retrieval instruction and selected-candidate consistency
+    if instr.candidate_id != primary.candidate_id:
+        errors.append(
+            "RetrievalInstruction.candidate_id does not match the selected CandidateSource"
+        )
+    if primary.evaluation_status != "complete":
+        errors.append(
+            "RetrievalInstruction requires the selected CandidateSource to have evaluation_status='complete'"
+        )
+    if primary.assessment is None:
+        errors.append("Selected CandidateSource with RetrievalInstruction must have an assessment")
+        return
+
+    cand_evidence_ids = {e.evidence_id for e in primary.evidence}
+    missing_ev = [eid for eid in instr.evidence_ids if eid not in cand_evidence_ids]
+    if missing_ev:
+        errors.append(
+            "RetrievalInstruction.evidence_ids references evidence missing from selected candidate"
+        )
+
+    # 4. Evidence-backed endpoint provenance and method matching
+    # Note: In Increment 4.0, schema validation checks structured finding metadata,
+    # evidence types, capture methods, and exact endpoint/method match. Increment 4c/4d
+    # (EvidenceCapturer + FindingExtractor/SourceEvaluator) is responsible for verifying
+    # that the captured document/artifact text itself actually substantiates the
+    # claimed endpoint_url and retrieval_method before emitting a verified finding.
+    findings_by_id = {f.finding_id: f for f in primary.findings}
+    ev_by_id = {e.evidence_id: e for e in primary.evidence}
+    retrieval_fids = primary.assessment.findings_by_dimension.get("retrieval_methods", [])
+    instr_ev_set = set(instr.evidence_ids)
+    _SUBSTANTIVE_CAPTURES = {"fetched_content", "observed_response", "manual_capture"}
+    _ELIGIBLE_RETRIEVAL_EV_TYPES = {
+        "observed_response",
+        "api_documentation",
+        "official_documentation",
+        "dataset_page",
+    }
+    endpoint_verified = False
+    for fid in retrieval_fids:
+        finding = findings_by_id.get(fid)
+        if not finding or finding.status != "verified" or not finding.value:
+            continue
+        overlapping_ids = set(finding.evidence_ids) & instr_ev_set
+        if not overlapping_ids:
+            continue
+        overlapping_ev = [ev_by_id[eid] for eid in overlapping_ids if eid in ev_by_id]
+        if not any(
+            ev.evidence_type in _ELIGIBLE_RETRIEVAL_EV_TYPES
+            and ev.capture_method in _SUBSTANTIVE_CAPTURES
+            for ev in overlapping_ev
+        ):
+            continue
+        # If the substantiating evidence is an observed_response, its captured URL
+        # must match the instruction endpoint (one endpoint's response cannot authorize another).
+        if all(ev.evidence_type == "observed_response" for ev in overlapping_ev) and not any(
+            _endpoints_match(str(instr.source_url), str(ev.source_url))
+            for ev in overlapping_ev
+        ):
+            continue
+        val = finding.value
+        method_match = (
+            val.get("method") == instr.retrieval_method
+            or val.get("retrieval_method") == instr.retrieval_method
+            or instr.retrieval_method in (val.get("methods") or [])
+        )
+        endpoints: List[str] = []
+        if isinstance(val.get("endpoint_url"), str):
+            endpoints.append(val["endpoint_url"])
+        if isinstance(val.get("endpoint_urls"), list):
+            endpoints.extend(x for x in val["endpoint_urls"] if isinstance(x, str))
+        if method_match and any(_endpoints_match(str(instr.source_url), ep) for ep in endpoints):
+            endpoint_verified = True
+            break
+    if not endpoint_verified:
+        errors.append(
+            "RetrievalInstruction source_url and retrieval_method must be backed by a "
+            "verified retrieval_methods finding with matching endpoint_url and evidence_ids"
+        )
+    if primary.assessment.connector.status not in {"implemented_tested", "not_required"}:
+        errors.append(
+            "RetrievalInstruction requires connector assessment status "
+            "'implemented_tested' or 'not_required'"
+        )
+
+    # 5. Access-class & authentication consistency
+    if primary.assessment.access_class != instr.access_class:
+        errors.append(
+            "RetrievalInstruction.access_class must match selected candidate access_class"
+        )
+    if primary.assessment.authentication_requirement != instr.authentication_requirement:
+        errors.append(
+            "RetrievalInstruction.authentication_requirement must match selected candidate"
+        )
+    if primary.assessment.quota.status == "exceeds_limit":
+        errors.append("Selected candidate exceeding quota limit cannot have a RetrievalInstruction")
+
+    # 6. Required license permissions and per-right conditions
+    if plan.planning_policy is None:
+        errors.append("PlanSpec.planning_policy is required when retrieval_instructions are emitted")
+    else:
+        required_rights = plan.planning_policy.usage_intent.required_rights
+        expected_conditional_rights: set[UsageRight] = set()
+        for right in required_rights:
+            perm = primary.assessment.license_permissions.get(right)
+            if perm is None:
+                errors.append(f"Selected candidate assessment missing required usage right '{right}'")
+                continue
+            if perm.verification_status != "verified" or not perm.finding_ids:
+                errors.append(f"Required usage right '{right}' must be verified with findings")
+                continue
+            if perm.status not in {"allowed", "conditional"}:
+                errors.append(
+                    f"Required usage right '{right}' has ineligible license status '{perm.status}'"
+                )
+                continue
+            if perm.status == "conditional":
+                expected_conditional_rights.add(right)
+                if perm.conditions_status != "satisfied" or not perm.conditions:
+                    errors.append(
+                        f"Conditional usage right '{right}' must have satisfied conditions"
+                    )
+                elif instr.license_conditions_by_right.get(right) != perm.conditions:
+                    errors.append(
+                        f"RetrievalInstruction.license_conditions_by_right['{right}'] must "
+                        "preserve the verified condition text"
+                    )
+            elif right in instr.license_conditions_by_right:
+                errors.append(
+                    f"Allowed usage right '{right}' must not carry conditional restrictions"
+                )
+        extra_rights = set(instr.license_conditions_by_right) - expected_conditional_rights
+        if extra_rights:
+            errors.append(
+                "RetrievalInstruction.license_conditions_by_right contains non-conditional "
+                f"or unrequired rights: {sorted(extra_rights)}"
+            )
+
+    # 7a. Live/recent freshness threshold consistency
+    if spec.requirement:
+        needs_freshness = (
+            spec.requirement.freshness_need in {"live", "recent"}
+            or spec.requirement.max_data_age_hours is not None
+            or bool(spec.requirement.max_data_age)
+        )
+        if needs_freshness:
+            expected_age, err = resolve_freshness_threshold_hours(spec.requirement)
+            if err:
+                errors.append(err)
+            elif expected_age is None:
+                errors.append("Live/recent freshness requirement has no resolvable max_data_age_hours")
+            else:
+                if not instr.requires_runtime_freshness_verification:
+                    errors.append(
+                        "RetrievalInstruction must set requires_runtime_freshness_verification=True "
+                        "for live/recent freshness requirements"
+                    )
+                if instr.max_data_age_hours != expected_age:
+                    errors.append(
+                        f"RetrievalInstruction.max_data_age_hours ({instr.max_data_age_hours}) "
+                        f"must preserve requirement threshold ({expected_age})"
+                    )
+        elif instr.requires_runtime_freshness_verification or instr.max_data_age_hours is not None:
+            errors.append(
+                "RetrievalInstruction must not set runtime freshness verification when no "
+                "live/recent freshness requirement exists"
+            )
+
+
+def _validate_replan_invariants(spec: DatasetSpec, errors: List[str]) -> None:
+    """Validate Orchestrator-owned bounded replanning history and exclusions."""
+    if spec.replan_count != len(spec.replan_history):
+        errors.append(
+            f"replan_count ({spec.replan_count}) must equal len(replan_history) ({len(spec.replan_history)})"
+        )
+    if spec.replan_count > 2:
+        errors.append("replan_count cannot exceed maximum of 2")
+
+    expected_numbers = list(range(1, len(spec.replan_history) + 1))
+    actual_numbers = [attempt.attempt_number for attempt in spec.replan_history]
+    if actual_numbers != expected_numbers:
+        errors.append("ReplanAttempt.attempt_number values must be sequential starting at 1")
+
+    if not spec.replan_history:
+        return
+
+    candidates_by_id = (
+        {c.candidate_id: c for c in spec.plan.candidate_sources} if spec.plan else {}
+    )
+    instructions = spec.plan.retrieval_instructions if spec.plan else []
+
+    for attempt in spec.replan_history:
+        excluded_urls_norm = {_normalize_endpoint_url(u) for u in attempt.excluded_urls}
+        for cid in attempt.excluded_candidate_ids:
+            cand = candidates_by_id.get(cid)
+            if cand is not None and cand.selection_status != "rejected":
+                errors.append(
+                    f"Excluded candidate {cid} from replan attempt {attempt.attempt_number} "
+                    "must have selection_status='rejected'"
+                )
+            for instr in instructions:
+                if instr.candidate_id == cid:
+                    errors.append(
+                        f"RetrievalInstruction cannot target excluded candidate {cid}"
+                    )
+        for instr in instructions:
+            if _normalize_endpoint_url(str(instr.source_url)) in excluded_urls_norm:
+                errors.append(
+                    f"RetrievalInstruction cannot target excluded endpoint URL '{instr.source_url}'"
+                )
+
+
 def validate_spec(spec: DatasetSpec) -> tuple[bool, List[str]]:
     """
     Validate a dataset spec.
@@ -1835,7 +2826,7 @@ def validate_spec(spec: DatasetSpec) -> tuple[bool, List[str]]:
     Returns:
         (is_valid, list_of_errors)
     """
-    errors = []
+    errors: List[str] = []
     
     # Check logical consistency
     if spec.requirement and not spec.requirement.is_supported:
@@ -1850,19 +2841,9 @@ def validate_spec(spec: DatasetSpec) -> tuple[bool, List[str]]:
         errors.append("Retrieval exists but plan missing (agents out of order)")
 
     if spec.plan:
-        source_types = {source.source_type for source in spec.plan.source_requirements}
-        source_priorities = [source.priority for source in spec.plan.source_requirements]
-        query_priorities = [query.priority for query in spec.plan.search_queries]
-        if len(source_priorities) != len(set(source_priorities)):
-            errors.append("Plan source requirement priorities must be unique")
-        if len(query_priorities) != len(set(query_priorities)):
-            errors.append("Plan search query priorities must be unique")
-        for query in spec.plan.search_queries:
-            if query.related_source_type not in source_types:
-                errors.append(
-                    f"Search query source type '{query.related_source_type}' "
-                    "does not match a source requirement"
-                )
+        _validate_plan_invariants(spec, errors)
+
+    _validate_replan_invariants(spec, errors)
     
     # Check provenance on sources
     if spec.retrieval:

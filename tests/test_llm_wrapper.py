@@ -374,6 +374,188 @@ def test_model_not_found_has_pull_command():
         llm.call("hello")
     assert isinstance(caught.value.__cause__, ollama.ResponseError)
 
+
+def test_real_transport_per_attempt_timeout_is_enforced_without_shared_mutation():
+    """Local loopback slow server must trigger httpx read timeout at attempt_timeout."""
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    stop_event = threading.Event()
+
+    class SlowHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            stop_event.wait(2.0)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"message": {"content": "{\\"ok\\": true}"}}')
+            except OSError:
+                pass
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        config = LLMConfig(
+            per_attempt_timeout_seconds=0.1,
+            total_timeout_seconds=0.05,
+            max_retries=0,
+        )
+        llm = LLMWrapper(config)
+        llm._host = f"http://127.0.0.1:{port}"
+        llm.client = llm._build_client(config.per_attempt_timeout_seconds)
+        initial_timeout = llm.client._client.timeout
+
+        start = time.monotonic()
+        with pytest.raises(LLMTimeoutError):
+            llm.call("hello")
+        elapsed = time.monotonic() - start
+
+        # Must time out well before the 2.0s server delay
+        assert elapsed < 1.2
+        # Shared client timeout must remain untouched
+        assert llm.client._client.timeout == initial_timeout
+    finally:
+        stop_event.set()
+        server.shutdown()
+        server.server_close()
+
+
+def test_retry_attempt_uses_remaining_total_budget_without_mutating_shared_client(monkeypatch):
+    """When attempt 1 consumes part of total_timeout, attempt 2 gets bounded <= remaining."""
+    import time
+
+    timeouts_seen = []
+
+    class FakeBoundedClient:
+        def __init__(self, host=None, timeout=None):
+            self.host = host
+            self.timeout = timeout
+            self._client = type("Inner", (), {"timeout": timeout, "close": lambda self: None})()
+
+        def chat(self, **kwargs):
+            timeouts_seen.append(self.timeout)
+            time.sleep(0.12)
+            if len(timeouts_seen) == 1:
+                return {"message": {"content": "not json"}}
+            return {"message": {"content": '{"ok": true}'}}
+
+    monkeypatch.setattr("core.llm_wrapper.OllamaClient", FakeBoundedClient)
+    config = LLMConfig(
+        per_attempt_timeout_seconds=0.5,
+        total_timeout_seconds=0.35,
+        max_retries=1,
+    )
+    llm = LLMWrapper(config)
+    initial_shared_timeout = llm.client._client.timeout
+
+    res = llm.call("hello")
+    assert res.success is True
+    assert len(timeouts_seen) == 2
+    assert timeouts_seen[0].read == pytest.approx(0.35, abs=0.05)
+    assert timeouts_seen[1].read < 0.30
+    assert llm.client._client.timeout == initial_shared_timeout
+
+
+def test_none_client_still_uses_bounded_timeout_never_unbounded_fallback(monkeypatch):
+    timeouts_seen = []
+
+    class FakeBoundedClient:
+        def __init__(self, host=None, timeout=None):
+            timeouts_seen.append(timeout)
+            self._client = type("Inner", (), {"timeout": timeout, "close": lambda self: None})()
+
+        def chat(self, **kwargs):
+            return {"message": {"content": '{"ok": true}'}}
+
+    monkeypatch.setattr("core.llm_wrapper.OllamaClient", FakeBoundedClient)
+    llm = LLMWrapper(LLMConfig(per_attempt_timeout_seconds=1.5, total_timeout_seconds=2.0))
+    llm.client = None
+
+    res = llm.call("hello")
+    assert res.success is True
+    assert len(timeouts_seen) == 2  # __init__ + bounded fallback in call()
+    assert timeouts_seen[1] is not None
+    assert timeouts_seen[1].read == pytest.approx(1.5, abs=0.1)
+
+
+def test_concurrent_llm_calls_do_not_corrupt_timeouts_or_call_count(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    class ConcurrentClient:
+        def __init__(self, host=None, timeout=None):
+            self.timeout = timeout
+            self._client = type("Inner", (), {"timeout": timeout, "close": lambda self: None})()
+
+        def chat(self, **kwargs):
+            return {"message": {"content": '{"ok": true}'}}
+
+    monkeypatch.setattr("core.llm_wrapper.OllamaClient", ConcurrentClient)
+    llm = LLMWrapper(LLMConfig(per_attempt_timeout_seconds=2.0, total_timeout_seconds=1.0))
+    shared_timeout = llm.client._client.timeout
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda i: llm.call(f"prompt {i}"), range(12)))
+
+    assert all(r.success and r.content == {"ok": True} for r in results)
+    assert llm.get_call_count() == 12
+    assert llm.client._client.timeout == shared_timeout
+
+
+def test_total_budget_blocks_retry_after_slow_first_attempt_and_closes_scoped_client(monkeypatch):
+    """If attempt 1 consumes total_timeout_seconds, retry is blocked and scoped client closes."""
+    import time
+
+    created_clients = []
+
+    class InnerSpy:
+        def __init__(self, timeout):
+            self.timeout = timeout
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class ScopedClientSpy:
+        def __init__(self, host=None, timeout=None):
+            self.timeout = timeout
+            self.calls = 0
+            self._client = InnerSpy(timeout)
+            created_clients.append(self)
+
+        def chat(self, **kwargs):
+            self.calls += 1
+            time.sleep(0.18)
+            return {"message": {"content": "invalid json"}}
+
+    monkeypatch.setattr("core.llm_wrapper.OllamaClient", ScopedClientSpy)
+    llm = LLMWrapper(
+        LLMConfig(
+            per_attempt_timeout_seconds=0.5,
+            total_timeout_seconds=0.15,
+            max_retries=1,
+        )
+    )
+    shared_client = created_clients[0]
+
+    with pytest.raises(LLMTimeoutError, match="exceeded total timeout"):
+        llm.call("hello")
+
+    # Shared client was never closed or used for the tighter scoped attempt
+    assert shared_client._client.closed is False
+    assert shared_client.calls == 0
+    # Exactly one request-scoped client was created, called once, and closed safely
+    assert len(created_clients) == 2
+    scoped = created_clients[1]
+    assert scoped.calls == 1
+    assert scoped._client.closed is True
+
 if __name__ == "__main__":
     # Run tests
     pytest.main([__file__, "-v"])
